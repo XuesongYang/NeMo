@@ -68,6 +68,7 @@ from nemo.lightning.pytorch.strategies.utils import (
     setup_data_sampler,
     setup_parallel_ranks,
 )
+from nemo.lightning.resume import AdapterPath
 from nemo.utils import logging
 from nemo.utils.callbacks.dist_ckpt_io import AsyncFinalizerCallback
 
