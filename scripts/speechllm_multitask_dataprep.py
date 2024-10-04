@@ -11,7 +11,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
-from encodec import EncodecModel
+# from encodec import EncodecModel
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
@@ -441,12 +441,13 @@ def main():
     args = parser.parse_args()
 
     if args.codec_model == 'encodec':
-        codec_model = EncodecModel.encodec_model_24khz()
-        codec_model.set_target_bandwidth(6.0)
-        codec_model.cuda()
-        codec_model.eval()
-        codec_model_sample_rate = 24000
-        codec_model_downsampling_factor = 320.0
+        pass
+        # codec_model = EncodecModel.encodec_model_24khz()
+        # codec_model.set_target_bandwidth(6.0)
+        # codec_model.cuda()
+        # codec_model.eval()
+        # codec_model_sample_rate = 24000
+        # codec_model_downsampling_factor = 320.0
     elif args.codec_model == 'uniaudio_codec':
         codec_config_path = os.path.join(os.path.dirname(args.codec_model_path), 'config.yaml')
         codec_config = OmegaConf.load(codec_config_path)
