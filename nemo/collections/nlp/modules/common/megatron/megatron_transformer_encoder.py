@@ -25,6 +25,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     build_attention_mask_3d,
 )
 from nemo.core.classes.exportable import Exportable
+import torch
 
 try:
     from apex.transformer.enums import AttnMaskType, ModelType

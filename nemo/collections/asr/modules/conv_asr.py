@@ -206,7 +206,7 @@ class ConvASREncoder(NeuralModule, Exportable, AccessMixin):
         """
         Find global max audio length across all nodes in distributed training and update the max_audio_length
         """
-        if torch.distributed.is_initialized():
+        if torch.distributed.is_initialized() and (not getattr(self, 'disable_torch_distributed', False)):
             global_max_len = torch.tensor([seq_length], dtype=torch.float32, device=device)
 
             # Update across all ranks in the distributed system
