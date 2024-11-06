@@ -131,6 +131,7 @@ __all__ = [
     "gpt_forward_step",
     "T5Model",
     "T5Config",
+    "T5Config220M",
     "t5_data_step",
     "t5_forward_step",
     "MaskedTokenLossReduction",
