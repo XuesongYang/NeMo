@@ -30,27 +30,6 @@ from nemo.collections.speechlm_generation.modules.prompt_table import VirtualPro
 from nemo.collections.llm import fn, T5Model, T5Config, T5Config220M
 
 
-def get_pseudo_tokens(num_virtual_tokens):
-    """
-    Takes in an integer and returns a list of strings where each string
-    is a numbered virtual token placeholder. If
-    num_virtual_tokens = 3, then this function returns:
-
-    ["<prompt_0>", "<prompt_1>", "<prompt_2>"]
-
-    Args:
-        num_virtual_tokens: (int) Number of virtual token strings you want to make
-
-    returns a list of string.
-
-    """
-    pseudo_tokens = [
-        VirtualPromptPlaceholderToken.BASE.value + str(i) + VirtualPromptPlaceholderToken.END.value
-        for i in range(num_virtual_tokens)
-    ]
-
-    return pseudo_tokens
-
 @dataclass
 class MCoreSpeechT5ModuleConfig(T5Config):
     # copied from nemo.collections.nlp.modules.common.megatron.token_level_encoder_decoder.MegatronTokenLevelEncoderDecoderSpeechLLMModule.__init__

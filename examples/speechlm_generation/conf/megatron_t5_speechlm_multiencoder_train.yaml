@@ -1,14 +1,17 @@
 name: megatron_t5_speechllm
 exp_dir: ???
+english_only_model: true
+tensor_model_parallel_size: 1
 
 ############ Data ############
 data:
-
-
+  dataset_type: t5
+  train_ds: ???  # a list of json files
+  validation_ds: ???  # TODO @xueyang: a list of json files. but now only support a single file.
 
 ############ Task Templates  ############
 tasks:
-  existing_tasks: []
+#  existing_tasks: []
   new_tasks: ["squad"]
   task_templates:
   - taskname: "squad"
@@ -19,12 +22,62 @@ tasks:
     answer_field: answer
 
 ############ Tokenizer ############
+#tokenizer:
+#  pretrained_model_name: "bert-large-cased",
+#  vocab_file: null  # "/pretrained_models/9a77f10c2793465e8e8a3fa5fcbef8b0_vocab.txt"
+#  merges_file: null
+#  use_fast: false  # whether to use fast HuggingFace tokenizer
+#  num_sentinel_tokens: 10_128 # if not set then 39184 - 29056.
 tokenizer:
   library: megatron
   type: BertWordPieceCase
-  model: null
-  vocab_file: null
-  merge_file: null
+  model: null  # specify `override_token_model` here if any.
+  vocab_file: null  # specify `override_vocab_file` here if any. For example, T5 TTS applie "/pretrained_models/9a77f10c2793465e8e8a3fa5fcbef8b0_vocab.txt".
+  merges_file: null  # TODO @xueyang: remove this and keep it by default inside function. Was not aware of any usage of this file.
+  num_sentinel_tokens: 10_128  # specify overrides here, but would keep 39184 - 29056 by default.
+  make_vocab_size_divisible_by: 128
+  tensor_model_parallel_size: ${tensor_model_parallel_size}
+  english_only_model: ${english_only_model}
+  phoneme_pro
+  g2p:
+    english:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      phoneme_dict: "scripts/tts_dataset_files/ipa_cmudict-0.7b_nv23.01.txt"
+      heteronyms: "scripts/tts_dataset_files/heteronyms-052722"
+      phoneme_probability: 0.8
+      ignore_ambiguous_words: False
+      use_chars: True
+      use_stresses: True
+      grapheme_prefix: ${model.data.grapheme_prefix}
+    spanish:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      phoneme_dict: "scripts/tts_dataset_files/es_ES/es_ES_nv230301.dict"
+      phoneme_probability: 0.8
+      use_chars: True
+      use_stresses: True
+      ignore_ambiguous_words: False
+      grapheme_prefix: ${model.data.grapheme_prefix}
+      locale: "es-ES"
+    mandarin:
+      _target_: nemo.collections.tts.g2p.models.zh_cn_pinyin.ChineseG2p
+      phoneme_dict: "scripts/tts_dataset_files/zh/36finals/ipa_dict_nv23.05.txt"
+      word_segmenter: "jieba"
+      phoneme_prefix: ""
+      phoneme_case: "lower"
+      tone_prefix: "#"
+      ascii_letter_prefix: ${model.data.grapheme_prefix}
+      ascii_letter_case: "upper"
+    german:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      phoneme_dict: "scripts/tts_dataset_files/de/de_nv230119.dict"
+      heteronyms: "scripts/tts_dataset_files/de/de_nv230119.heteronym"
+      phoneme_probability: 0.8
+      ignore_ambiguous_words: False
+      use_chars: True
+      use_stresses: True
+      grapheme_case: mixed
+      grapheme_prefix: ${model.data.grapheme_prefix}
+      locale: "de-DE"
 
 ############ Optimizer ############
 optim:
@@ -44,7 +97,7 @@ optim:
 ############ Trainer ############
 strategy:
   _target_: nemo.lightning.MegatronStrategy
-  tensor_model_parallel_size: 1
+  tensor_model_parallel_size: ${tensor_model_parallel_size}
   pipeline_model_parallel_size: 1
 
 callbacks:
