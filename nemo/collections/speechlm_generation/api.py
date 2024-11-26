@@ -16,6 +16,7 @@ from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenize
 from nemo.collections.tts.data.speechllm.t5_speechllm_dataset import _get_default_text_tokenizer_conf
 from nemo.collections.tts.models.speechllm.megatron_base_speechllm_prompt_model import get_pseudo_tokens
 from hydra.utils import instantiate
+from nemo.collections.speechlm_generation.speech_generation_tokenizer import build_tokenizer
 
 
 def speech_generation_llm_train(cfg: DictConfig):
@@ -30,7 +31,7 @@ def speech_generation_llm_train(cfg: DictConfig):
             data_config.pop(key)
 
     ############### 1. build static basic tokenizer #########################
-
+    tokenizer, phoneme_tokenizer = build_tokenizer(cfg)
 
     ############### 2. build model #########################
     model_config = SpeechT5Config(

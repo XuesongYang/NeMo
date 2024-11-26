@@ -38,7 +38,8 @@ tokenizer:
   make_vocab_size_divisible_by: 128
   tensor_model_parallel_size: ${tensor_model_parallel_size}
   english_only_model: ${english_only_model}
-  phoneme_pro
+  phoneme_probability: null  # TODO @xueyang: should refactor this configs with multiple languages setups.
+  use_ipa: false
   g2p:
     english:
       _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p

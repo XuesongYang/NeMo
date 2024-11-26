@@ -118,8 +118,7 @@ def _build_vocab(config: DictConfig, tokenizer, dataset_type: str = "t5"):
     Pad vocab size so it is divisible by model parallel size and
     still having GPU friendly size.
     """
-    # num_sentinel_tokens = config.num_sentinel_tokens
-    tokenizer = add_special_tokens_to_tokenizer(
+    tokenizer = _add_special_tokens_to_tokenizer(
         tokenizer=tokenizer,
         tokenizer_cfg=config,
         dataset_type=dataset_type,
@@ -274,6 +273,7 @@ def _add_base_special_tokens(tokenizer, is_huggingface_converted_model):
 # )
 
 def build_tokenizer(cfg: DictConfig):
+    # static tokenizer
     tokenizer = _build_tokenizer(config=cfg.tokenizer)
     tokenizer, padded_vocab_size = _build_vocab(config=cfg.tokenizer, tokenizer=tokenizer, dataset_type=cfg.data.datatype)
 
@@ -290,6 +290,7 @@ def build_tokenizer(cfg: DictConfig):
         tokenizer.add_special_tokens({'additional_special_tokens': pseudo_tokens})
 
     # introduce phone tokens and add to tokenizer if multiple languages are applied.
+    # TODO @xueyang: should remove english_only_model option and instead let user config language. Providing ipa and arpabet phoneme symbol options.
     if not cfg.tokenizer.get('english_only_model', False):
         tokenizer.add_phone_tokens_to_special_tokens()
 
@@ -297,20 +298,22 @@ def build_tokenizer(cfg: DictConfig):
     phoneme_tokenizer = None
     if cfg.tokenizer.get("english_only_model", False):
         phoneme_tokenizer = instantiate(
-            _get_default_text_tokenizer_conf(phoneme_probability=phoneme_probability, use_ipa=use_ipa)
+            _get_default_text_tokenizer_conf(phoneme_probability=cfg.tokenizer.phoneme_probability, use_ipa=cfg.tokenizer.use_ipa)
         ).text_tokenizer
     else:
-        self.g2p = {"fr": lambda x: x}
-        if kwargs.get("g2p", None):
-            if "english" in kwargs["g2p"]:
-                english_g2p = instantiate(kwargs["g2p"]["english"])
-                self.g2p["en"] = lambda x: english_g2p(x)
-            if "spanish" in kwargs["g2p"]:
-                spanish_g2p = instantiate(kwargs["g2p"]["spanish"])
-                self.g2p["es"] = lambda x: spanish_g2p(x)
-            if "mandarin" in kwargs["g2p"]:
-                mandarin_g2p = instantiate(kwargs["g2p"]["mandarin"])
-                self.g2p["zh"] = lambda x: mandarin_g2p(x)
-            if "german" in kwargs["g2p"]:
-                german_g2p = instantiate(kwargs["g2p"]["german"])
-                self.g2p["de"] = lambda x: german_g2p(x)
+        raise NotImplementedError("Multiple languages tokenization is not fully implemented yet. Will iterate the implementation after figuring out English language.")
+        g2p = {"fr": lambda x: x}
+        if cfg.tokenizer.get("g2p", None):
+            if "english" in cfg.tokenizer["g2p"]:
+                english_g2p = instantiate(cfg.tokenizer["g2p"]["english"])
+                g2p["en"] = lambda x: english_g2p(x)
+            if "spanish" in cfg.tokenizer["g2p"]:
+                spanish_g2p = instantiate(cfg.tokenizer["g2p"]["spanish"])
+                g2p["es"] = lambda x: spanish_g2p(x)
+            if "mandarin" in cfg.tokenizer["g2p"]:
+                mandarin_g2p = instantiate(cfg.tokenizer["g2p"]["mandarin"])
+                g2p["zh"] = lambda x: mandarin_g2p(x)
+            if "german" in cfg.tokenizer["g2p"]:
+                german_g2p = instantiate(cfg.tokenizer["g2p"]["german"])
+                g2p["de"] = lambda x: german_g2p(x)
+    return tokenizer, phoneme_tokenizer
