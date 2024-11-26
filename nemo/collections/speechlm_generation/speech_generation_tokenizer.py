@@ -316,4 +316,5 @@ def build_tokenizer(cfg: DictConfig):
             if "german" in cfg.tokenizer["g2p"]:
                 german_g2p = instantiate(cfg.tokenizer["g2p"]["german"])
                 g2p["de"] = lambda x: german_g2p(x)
+
     return tokenizer, phoneme_tokenizer

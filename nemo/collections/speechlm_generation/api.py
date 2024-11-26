@@ -24,24 +24,16 @@ def speech_generation_llm_train(cfg: DictConfig):
     cfg = OmegaConf.to_container(cfg, resolve=True)
     logging.info(f'Hydra config: {OmegaConf.to_yaml(cfg)}')
 
-    ## retain common settings in data config
-    data_config = deepcopy(cfg['data'])
-    for key in ['train_ds', 'validation_ds', 'test_ds']:
-        if key in data_config:
-            data_config.pop(key)
+    # ## retain common settings in data config
+    # data_config = deepcopy(cfg['data'])
+    # for key in ['train_ds', 'validation_ds', 'test_ds']:
+    #     if key in data_config:
+    #         data_config.pop(key)
 
     ############### 1. build static basic tokenizer #########################
     tokenizer, phoneme_tokenizer = build_tokenizer(cfg)
 
-    ############### 2. build model #########################
-    model_config = SpeechT5Config(
-        task_templates=cfg["task_templates"],
-
-    )
-    model = MegatronT5SpeechLMModel(config=model_config, tokenizer=tokenizer)
-
-    ############### 3. set up data module #########################
-    # expanded tokenizer as input.
+    ############### 2. set up data module #########################
     # TODO @xueyang: there are so many params shared by both dataset and model. During model initialization, it loads
     #   data's config and assign to the same name of variables. So what is the better way to organize the common params?
     #   example params: speech_codebook_size, num_speech_codebooks, speech_offsets
@@ -64,6 +56,13 @@ def speech_generation_llm_train(cfg: DictConfig):
         context_conditioning=model_config.context_conditioning,
         use_beta_binomial_interpolator=model_config.use_beta_binomial_interpolator,
     )
+
+    ############### 2. build model #########################
+    model_config = SpeechT5Config(
+        task_templates=cfg["task_templates"],
+
+    )
+    model = MegatronT5SpeechLMModel(config=model_config, tokenizer=tokenizer)
 
     # 3. update model's phoneme_tokenizer aligning with dataset's.
     if model_config.phoneme_tokenizer is None:

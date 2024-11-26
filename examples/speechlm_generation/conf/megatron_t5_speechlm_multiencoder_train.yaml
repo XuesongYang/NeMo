@@ -5,9 +5,19 @@ tensor_model_parallel_size: 1
 
 ############ Data ############
 data:
+  sample_rate: 24_000
   dataset_type: t5
-  train_ds: ???  # a list of json files
-  validation_ds: ???  # TODO @xueyang: a list of json files. but now only support a single file.
+  encoder_type: "multi_transformer"
+  train_ds:
+    manifest_filepath: ???  # a list of json files.
+    sample_rate: ${sample_rate}
+    use_lhotse: false
+    encoder_type: ${encoder_type}
+  validation_ds:  # TODO @xueyang: a list of json files. but now only support a single file.
+    manifest_filepath: ???
+    sample_rate: ${sample_rate}
+    use_lhotse: false
+    encoder_type: ${encoder_type}
 
 ############ Task Templates  ############
 tasks:
