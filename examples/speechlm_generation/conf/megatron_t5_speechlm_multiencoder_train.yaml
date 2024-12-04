@@ -3,6 +3,15 @@ exp_dir: ???
 english_only_model: true
 tensor_model_parallel_size: 1
 
+# speech codecs
+num_speech_codebooks: 8
+seq_pattern: "parallel" # parallel, delay_parallel, flatten
+
+lm_vocab_size: 30_000
+
+virtual_prompt_style: "p-tuning" # one of 'prompt-tuning', 'p-tuning', or 'inference'
+
+max_position_embeddings: 512
 ############ Data ############
 data:
   sample_rate: 24_000
@@ -13,6 +22,9 @@ data:
     sample_rate: ${sample_rate}
     use_lhotse: false
     encoder_type: ${encoder_type}
+    num_speech_codebooks: ${num_speech_codebooks}
+    lm_vocab_size: ${lm_vocab_size}
+    seq_pattern: ${seq_pattern}
   validation_ds:  # TODO @xueyang: a list of json files. but now only support a single file.
     manifest_filepath: ???
     sample_rate: ${sample_rate}

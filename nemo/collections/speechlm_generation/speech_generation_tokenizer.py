@@ -317,4 +317,4 @@ def build_tokenizer(cfg: DictConfig):
                 german_g2p = instantiate(cfg.tokenizer["g2p"]["german"])
                 g2p["de"] = lambda x: german_g2p(x)
 
-    return tokenizer, phoneme_tokenizer
+    return tokenizer, phoneme_tokenizer, pseudo_tokens, task_templates["task_templates"]

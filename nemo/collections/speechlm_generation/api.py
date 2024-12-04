@@ -1,6 +1,7 @@
 from nemo import lightning as nl
 from nemo.collections import llm
 from nemo.collections.common.tokenizers import AutoTokenizer
+from nemo.collections.speechlm_generation.modules.prompt_table import VirtualPromptStyle
 from nemo.utils import logging
 from copy import deepcopy
 import re
@@ -31,7 +32,7 @@ def speech_generation_llm_train(cfg: DictConfig):
     #         data_config.pop(key)
 
     ############### 1. build static basic tokenizer #########################
-    tokenizer, phoneme_tokenizer = build_tokenizer(cfg)
+    tokenizer, phoneme_tokenizer, pseudo_tokens, task_templates = build_tokenizer(cfg)
 
     ############### 2. set up data module #########################
     # TODO @xueyang: there are so many params shared by both dataset and model. During model initialization, it loads
@@ -43,18 +44,17 @@ def speech_generation_llm_train(cfg: DictConfig):
     # Note:
     #   - "taskname" in manifest should match "taskname" in task_templates. We don't need this entry anymore, but it would be great to keep them as a sanity-check.
     #
+
+    virtual_prompt_source = VirtualPromptStyle(cfg.virtual_prompt_style)
+
     data = T5SpeechGenerationDataModule(
         config=cfg["data"],
         tokenizer=tokenizer,
-        virtual_prompt_source=model_config.virtual_prompt_source,
-        task_templates=model_config.task_templates,
-        pseudo_tokens=model_config.pseudo_tokens,
-        pad_token_id=model_config.pad_token_id,
-        lm_vocab_size=model_config.lm_vocab_size,
-        seq_pattern=model_config.seq_pattern,
-        english_only_model=model_config.english_only_model,
-        context_conditioning=model_config.context_conditioning,
-        use_beta_binomial_interpolator=model_config.use_beta_binomial_interpolator,
+        virtual_prompt_source=virtual_prompt_source,
+        task_templates=task_templates,
+        pseudo_tokens=pseudo_tokens,  # TODO: remove it and directly get it from tokenizer's member, e.g. tokenizer.additional_special_tokens.
+        context_conditioning=cfg.context_conditioning,
+        use_beta_binomial_interpolator=cfg.use_beta_binomial_interpolator,
     )
 
     ############### 2. build model #########################

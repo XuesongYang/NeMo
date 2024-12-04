@@ -124,16 +124,21 @@ class T5SpeechGenerationDataModule(pl.LightningDataModule, IOMixin):
         virtual_prompt_source: VirtualPromptSource,
         task_templates: Dict,
         pseudo_tokens: Any,
-        pad_token_id: int,
-        lm_vocab_size: int,
-        seq_pattern: str = "parallel",
-        english_only_model: bool = False,
+        # pad_token_id: int,
+        # lm_vocab_size: int,
+        # seq_pattern: str = "parallel",
+        # english_only_model: bool = False,
         context_conditioning: str = "decoder",
         use_beta_binomial_interpolator: bool = False,
     ):
         super().__init__()
         self.cfg = OmegaConf.create(config) if not isinstance(config, DictConfig) else config
         self.tokenizer = tokenizer
+        if tokenizer.pad_id is not None:
+            self.pad_token_id = tokenizer.pad_id
+        else:
+            self.pad_token_id = tokenizer.unk_id
+
         self._train_ds = None
         self._validation_ds = None
         self._test_ds = None
@@ -141,13 +146,14 @@ class T5SpeechGenerationDataModule(pl.LightningDataModule, IOMixin):
         self._test_names = None
         self.init_global_step = 0
         self.data_sampler = None
+
         self.virtual_prompt_source = virtual_prompt_source
         self.task_templates = task_templates
         self.pseudo_tokens = pseudo_tokens
-        self.pad_token_id = pad_token_id
-        self.lm_vocab_size = lm_vocab_size
-        self.seq_pattern = seq_pattern
-        self.english_only_model = english_only_model
+
+        # self.lm_vocab_size = lm_vocab_size
+        # self.seq_pattern = seq_pattern
+        # self.english_only_model = english_only_model
         self.context_conditioning = context_conditioning
         self.use_beta_binomial_interpolator = use_beta_binomial_interpolator
 
@@ -193,6 +199,13 @@ class T5SpeechGenerationDataModule(pl.LightningDataModule, IOMixin):
         if data_cfg.get("is_tarred", False):
             NotImplementedError(f"Tarred dataset support is not ready yet.")
         else:
+            if mode == "train":
+                for_train = True
+            else:
+                for_train = False
+
+            max_seq_length = data_cfg.get('max_seq_length', self.cfg.max_position_embeddings)
+
             return T5SpeechLMDataset(
                 datasets=data_cfg.manifest_filepath,
                 tokenizer=self.tokenizer,
@@ -201,43 +214,43 @@ class T5SpeechGenerationDataModule(pl.LightningDataModule, IOMixin):
                 task_templates=self.task_templates,
                 pseudo_tokens=self.pseudo_tokens,
                 pad_token_id=self.pad_token_id,
-                max_seq_length=self.cfg.data.get('max_seq_length', self.frozen_model.cfg.max_position_embeddings),
-                min_seq_length=self.cfg.data.get('min_seq_length', 1),
-                add_bos=self.cfg.data.get('add_bos', False),
-                add_eos=self.cfg.data.get('add_eos', True),
-                decoder_starts_with_pad=self.cfg.data.get('decoder_starts_with_pad', False),
-                add_eos_to_decoder_output=self.cfg.data.get('add_eos_to_decoder_output', True),
-                add_sentinel_to_input=self.cfg.data.get('add_sentinel_to_input', True),
-                ul2_prompt_token=self.cfg.data.get('ul2_prompt_token', None),
+                max_seq_length=max_seq_length,
+                min_seq_length=data_cfg.get('min_seq_length', 1),
+                add_bos=data_cfg.get('add_bos', False),
+                add_eos=data_cfg.get('add_eos', True),
+                decoder_starts_with_pad=data_cfg.get('decoder_starts_with_pad', False),
+                add_eos_to_decoder_output=data_cfg.get('add_eos_to_decoder_output', True),
+                add_sentinel_to_input=data_cfg.get('add_sentinel_to_input', True),
+                ul2_prompt_token=data_cfg.get('ul2_prompt_token', None),
                 for_train=for_train,
-                segment_max_duration=self.cfg.data.get('segment_max_duration', None),
-                trim=self.cfg.data.get('trim', None),
-                trim_ref=self.cfg.data.get('trim_ref', None),
-                trim_top_db=self.cfg.data.get('trim_top_db', None),
-                trim_frame_length=self.cfg.data.get('trim_frame_length', None),
-                trim_hop_length=self.cfg.data.get('trim_hop_length', None),
-                pad_multiple=self.cfg.data.get('pad_multiple', 1),
-                pitch_augment=self.cfg.data.get('pitch_augment', None),
-                sup_data_path=self.cfg.data.get('sup_data_path', None),
-                codec_folder=self.cfg.data.get('codec_folder', None),
-                speech_offset=self.cfg.data.get('speech_offset', None),
-                train_task=self.cfg.data.get('train_task', "tts"),
-                seq_pattern=self.cfg.get('seq_pattern', 'delay_parallel'),
-                use_attention_prior=self.cfg.data.get('use_attention_prior', False),
-                attention_prior_scaling_factor=self.cfg.data.get('attention_prior_scaling_factor', 1.0),
-                cross_attention_epsilon=self.cfg.data.get('cross_attention_epsilon', 0.0),
-                lm_vocab_size=self.lm_vocab_size,
-                num_speech_codebooks=self.num_speech_codebooks,
-                codebook_fps=self.cfg.data.get('codebook_fps', 86),
-                add_special_tokens_to_only_first_codebook=self.cfg.data.get(
+                segment_max_duration=data_cfg.get('segment_max_duration', None),
+                trim=data_cfg.get('trim', None),
+                trim_ref=data_cfg.get('trim_ref', None),
+                trim_top_db=data_cfg.get('trim_top_db', None),
+                trim_frame_length=data_cfg.get('trim_frame_length', None),
+                trim_hop_length=data_cfg.get('trim_hop_length', None),
+                pad_multiple=data_cfg.get('pad_multiple', 1),
+                pitch_augment=data_cfg.get('pitch_augment', None),
+                sup_data_path=data_cfg.get('sup_data_path', None),
+                codec_folder=data_cfg.get('codec_folder', None),
+                speech_offset=data_cfg.get('speech_offset', None),
+                train_task=data_cfg.get('train_task', "tts"),
+                seq_pattern=data_cfg.get('seq_pattern', 'delay_parallel'),
+                use_attention_prior=data_cfg.get('use_attention_prior', False),
+                attention_prior_scaling_factor=data_cfg.get('attention_prior_scaling_factor', 1.0),
+                cross_attention_epsilon=data_cfg.get('cross_attention_epsilon', 0.0),
+                lm_vocab_size=data_cfg.lm_vocab_size,
+                num_speech_codebooks=data_cfg.num_speech_codebooks,
+                codebook_fps=data_cfg.get('codebook_fps', 86),
+                add_special_tokens_to_only_first_codebook=data_cfg.get(
                     'add_special_tokens_to_only_first_codebook', False
                 ),
-                context_pattern=self.cfg.data.get('context_pattern', 'parallel'),
-                context_duration_min=self.cfg.data.get('context_duration_min', 3.0),
-                context_duration_max=self.cfg.data.get('context_duration_max', 5.0),
-                g2p=self.cfg.data.get('g2p', None),
-                skip_datasets=self.cfg.data.get('skip_datasets', []),
-                english_only_model=self.cfg.get('english_only_model', False),
+                context_pattern=data_cfg.get('context_pattern', 'parallel'),
+                context_duration_min=data_cfg.get('context_duration_min', 3.0),
+                context_duration_max=data_cfg.get('context_duration_max', 5.0),
+                g2p=data_cfg.get('g2p', None),
+                skip_datasets=data_cfg.get('skip_datasets', []),
+                english_only_model=data_cfg.get('english_only_model', False),
                 use_ipa=data_cfg.get('use_ipa', False),
                 context_conditioning=data_cfg.get('context_conditioning', "decoder"),
                 use_beta_binomial_interpolator=data_cfg.get('use_beta_binomial_interpolator', False),
