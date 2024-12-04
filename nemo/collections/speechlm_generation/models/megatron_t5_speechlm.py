@@ -12,6 +12,7 @@ from megatron.core.enums import ModelType
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.spec_utils import ModuleSpec
 
 from nemo.utils import logging
 
@@ -161,8 +162,8 @@ class SpeechT5Config(TransformerConfig, io.IOMixin):
                 self.num_layers // p_size
             ) % vp_size == 0, "Make sure the number of model chunks is the same across all pipeline stages."
 
-        from megatron.core import parallel_state
-        from megatron.core.models.T5.t5_model import T5Model as MCoreT5Model
+        # from megatron.core import parallel_state
+        # from megatron.core.models.T5.t5_model import T5Model as MCoreT5Model
 
         encoder_config = copy.deepcopy(self)
         encoder_config.num_layers = self.encoder_num_layers

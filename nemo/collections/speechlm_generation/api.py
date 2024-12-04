@@ -60,7 +60,6 @@ def speech_generation_llm_train(cfg: DictConfig):
     ############### 2. build model #########################
     model_config = SpeechT5Config(
         task_templates=cfg["task_templates"],
-
     )
     model = MegatronT5SpeechLMModel(config=model_config, tokenizer=tokenizer)
 
