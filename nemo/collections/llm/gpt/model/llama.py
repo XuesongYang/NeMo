@@ -185,28 +185,12 @@ class Llama31Config405B(Llama31Config):
 
 @dataclass
 class Llama32Config1B(Llama31Config):
-    scale_factor: int = 32
-    share_embeddings_and_output_weights: bool = True
     rotary_base: int = 500_000
+    seq_length: int = 131072
     num_layers: int = 16
     hidden_size: int = 2048
     ffn_hidden_size: int = 8192
     num_attention_heads: int = 32
-    num_query_groups: int = 8
-    make_vocab_size_divisible_by: int = 128
-
-
-@dataclass
-class Llama32Config3B(Llama31Config):
-    scale_factor: int = 32
-    share_embeddings_and_output_weights: bool = True
-    rotary_base: int = 500_000
-    num_layers: int = 28
-    hidden_size: int = 3072
-    ffn_hidden_size: int = 8192
-    num_attention_heads: int = 24
-    num_query_groups: int = 8
-    make_vocab_size_divisible_by: int = 128
 
 
 @dataclass

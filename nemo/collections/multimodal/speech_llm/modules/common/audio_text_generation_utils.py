@@ -50,7 +50,29 @@ except (ImportError, ModuleNotFoundError):
 __all__ = [
     "get_computeprob_response",
     "generate",
+    "default_inference_config",
+    "clean_end_string",
 ]
+
+
+default_inference_config = {'tokens_to_generate': 128}
+
+
+def clean_end_string(text: list[str], tokenizer, end_string: Optional[str] = None):
+    if end_string is None:
+        return text
+
+    text_list = [text] if isinstance(text, str) else text
+    end_string_re = tokenizer.ids_to_text(tokenizer.text_to_ids(end_string))
+    cleaned_text = []
+    for t in text_list:
+        for es in [end_string_re, end_string]:
+            if t.endswith(es):
+                t = t[: -len(es)].strip()
+        cleaned_text.append(t)
+    if isinstance(text, str):
+        return cleaned_text[0]
+    return cleaned_text
 
 
 def get_computeprob_response(tokenizer, response, inputs):
@@ -340,7 +362,7 @@ def generate(
             token_ids: List[Tensor], output sentence token ids
             offsets: List[List[int]]  # list of tokens start positions in text
     """
-    if 'strategy' in strategy_args:
+    if strategy_args.get('strategy', None) is not None:
         inference_strategy = strategy_args['strategy']
     else:
         inference_strategy = model_inference_strategy_dispatcher(model)
@@ -566,7 +588,7 @@ def sample_sequence_batch(
         maxlen = inference_strategy.clip_max_len(maxlen)
         lengths = torch.ones([batch_size]).long().cuda() * maxlen
         while context_length < maxlen:
-            batch, tensor_shape = inference_strategy.prepare_batch_at_step(
+            batch = inference_strategy.prepare_batch_at_step(
                 tokens,
                 input_embeddings,
                 maxlen,
@@ -576,7 +598,7 @@ def sample_sequence_batch(
                 context_length,
                 compute_attention_mask,
             )
-            output = inference_strategy.forward_step(batch, tensor_shape)
+            output = inference_strategy.forward_step(batch)
             if parallel_state.is_pipeline_last_stage():
                 if compute_logprob:
                     output = output[0]['logits']

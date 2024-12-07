@@ -14,6 +14,7 @@
 
 import omegaconf
 import torch
+import omegaconf
 
 from nemo.collections.nlp.modules.common import VirtualPromptSource
 from nemo.core import Dataset

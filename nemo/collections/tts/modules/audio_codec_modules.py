@@ -96,6 +96,7 @@ class SLMDiscriminator(NeuralModule):
         slm_layers=13,
         initial_channel=64,
         use_spectral_norm=False,
+        lrelu_slope=0.1,
     ):
         super().__init__()
 
@@ -106,7 +107,11 @@ class SLMDiscriminator(NeuralModule):
                 f"torchaudio is not installed but is necessary to instantiate a {self.__class__.__name__}"
             )
 
+        self.lrelu_slope = lrelu_slope
+
+        # define slm model
         self.slm_model = SSLModel(slm_model_name)
+        self.slm_model.ssl_model.feature_extractor._requires_grad = False
 
         # Freeze slm model
         self.slm_model.freeze()
@@ -203,6 +208,7 @@ class Conv1dNorm(NeuralModule):
         stride: int = 1,
         dilation: int = 1,
         padding: Optional[int] = None,
+        activation: Optional[str] = None
     ):
         super().__init__()
         if not padding:
@@ -217,6 +223,10 @@ class Conv1dNorm(NeuralModule):
             padding_mode="reflect",
         )
         self.conv = nn.utils.weight_norm(conv)
+        if activation is not None:
+            self.activation = CodecActivation(activation=activation, channels=out_channels)
+        else:
+            self.activation = None
 
     @property
     def input_types(self):
@@ -237,6 +247,8 @@ class Conv1dNorm(NeuralModule):
     @typecheck()
     def forward(self, inputs, input_len):
         out = self.conv(inputs)
+        if self.activation is not None:
+            out = self.activation(out)
         out = mask_sequence_tensor(out, input_len)
         return out
 

@@ -1,6 +1,7 @@
 from nemo.collections.llm.t5.model.t5 import (
     MaskedTokenLossReduction,
     T5Config,
+    T5Config220M,
     T5Model,
     local_layer_spec,
     t5_data_step,
@@ -10,6 +11,7 @@ from nemo.collections.llm.t5.model.t5 import (
 
 __all__ = [
     "T5Config",
+    "T5Config220M",
     "T5Model",
     "MaskedTokenLossReduction",
     "t5_data_step",

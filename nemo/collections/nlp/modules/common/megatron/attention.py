@@ -39,6 +39,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     attention_mask_func,
 )
 from nemo.core import adapter_mixins
+from nemo.utils import logging
 
 try:
     from apex.transformer.enums import AttnMaskType, AttnType
@@ -388,6 +389,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         # Pre-allocate memory for key-values for inference.
         # =================================================
         if set_inference_key_value_memory:
+            logging.debug(f"Initializing KV Cache.")
             assert inference_max_sequence_len and inference_max_sequence_len > 0
             self.inference_key_memory = self._allocate_memory(
                 inference_max_sequence_len, hidden_states.size(1), hidden_states.dtype, hidden_states.device
@@ -415,6 +417,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         # =====================
 
         if self.attention_type == AttnType.self_attn:
+            logging.debug(f"Start Self-Attention!")
             # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
             if self.is_adapter_available():
@@ -889,6 +892,7 @@ class CoreAttention(MegatronModule):
             key_layer.size(0),
             query_layer.size(3),
         )
+        logging.debug(f"query_layer.shape={query_layer.size()}\tkey_layer.shape={key_layer.size()}")
 
         # ==================================================
         # Update attention mask for inference. [b, np, sq, sk]
@@ -1011,6 +1015,9 @@ class CoreAttention(MegatronModule):
             attention_scores += attention_bias
 
         attention_probs = self.scale_mask_softmax(attention_scores, attention_mask)
+        logging.debug(f"attention_type={self.attention_type}")
+        logging.debug(f"attention_scores.shape={attention_scores.shape}")
+        logging.debug(f"attention_mask.shape={attention_mask.shape}")
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
 

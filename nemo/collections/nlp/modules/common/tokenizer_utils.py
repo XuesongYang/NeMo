@@ -31,7 +31,7 @@ megatron_tokenizer_model_map = {
 
 def get_tokenizer_list() -> List[str]:
     """
-    Returns all all supported tokenizer names
+    Returns all supported tokenizer names
     """
     s = set(get_huggingface_pretrained_lm_models_list(include_external=False))
     s.update(set(get_huggingface_pretrained_lm_models_list(include_external=True)))
