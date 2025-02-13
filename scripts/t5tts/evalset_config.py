@@ -226,4 +226,14 @@ dataset_meta_info = {
         'whisper_language': 'pl',
         'load_cached_codes_if_available': False
     },
+    'libri_val_xueyang': {
+        'manifest_path': '/home/xueyang/workspace2/mls_release_for_interspeech25/eval/manifests/libri360_val.json',
+        'audio_dir': '/mnt/sdb/xueyang_data/LibriTTS',
+        'feature_dir': '/mnt/sdb/xueyang_data/LibriTTS',
+    },
+    'libri_unseen_test_xueyang': {
+        'manifest_path': '/home/xueyang/workspace2/mls_release_for_interspeech25/eval/manifests/test_clean_withContextAudioPaths.json',
+        'audio_dir': '/mnt/sdb/xueyang_data/LibriTTS',
+        'feature_dir': '/mnt/sdb/xueyang_data/LibriTTS',
+    },
 }
