@@ -6,6 +6,7 @@ import argparse
 import librosa
 import scipy.stats as stats
 import numpy as np
+import glob
 
 def find_sample_audios(audio_dir):
     file_list = []
@@ -43,12 +44,17 @@ def main():
     for audio_dir in audio_dirs:
         print("Evaluating audio dir: ", audio_dir)
         audio_dir_path = os.path.join(args.exp_base_dir, audio_dir, "audio")
-        audio_files = find_sample_audios(audio_dir_path)
+        audio_files = list()
+        for audio_dir_repeat in glob.glob(f"{audio_dir_path}/repeat_*"):
+            audio_files_repeat = find_sample_audios(audio_dir_repeat)
+            audio_files.extend(audio_files_repeat)
+
         for audio_file in audio_files:
+            audio_example_index = audio_file.rsplit("_", 1)[-1].split(".")[0]
             pred_wav, sr = librosa.load(audio_file, sr=16000)
             pred_wav = torch.tensor(pred_wav).to(device).unsqueeze(0)
 
-            gt_path = audio_file.replace("predicted_audio", "target_audio")
+            gt_path = f"{audio_dir_path}/target_audio_{audio_example_index}.wav"
             gt_wav, sr = librosa.load(gt_path, sr=16000)
             gt_wav = torch.tensor(gt_wav).to(device).unsqueeze(0)
             with torch.no_grad():
