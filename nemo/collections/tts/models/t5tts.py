@@ -101,6 +101,7 @@ def worker_init_fn(worker_id):
 
 class T5TTS_Model(ModelPT):
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
+        # TODO @xueyang: remove legacy lines.
         # Convert to Hydra 1.0 compatible DictConfig
         cfg = model_utils.convert_model_config_to_dict_config(cfg)
         cfg = model_utils.maybe_update_config_version(cfg)
@@ -224,6 +225,7 @@ class T5TTS_Model(ModelPT):
         )
         return tokenizer, text_conditioning_tokenizer
 
+    # TODO @xueyang: no need defining this logger. It is legacy.
     @property
     def tb_logger(self):
         if self._tb_logger is None:
