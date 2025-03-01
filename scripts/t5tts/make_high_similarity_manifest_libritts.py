@@ -127,7 +127,7 @@ if __name__ == "__main__":
     pool.join()
 
     # do not filter by min SSIM. Better add such filter during model training.
-    out_manifest_path = manifest.replace(".json", "_withContextAudio.json")
+    out_manifest_path = manifest.replace(".json", f"_withContextAudioMinDur{int(context_min_duration)}.json")
     write_manifest(out_manifest_path, records_new)
     print("Length of original manifest: ", len(records))
     print("Length of filtered manifest: ", len(records_new))
