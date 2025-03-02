@@ -44,7 +44,11 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx):
         audio_file_path = self.combined_file_list[idx]["audio_file_path"]
         rel_audio_path = self.combined_file_list[idx]["rel_file_path"]
-        audio, audio_length = self.get_wav_from_filepath(audio_file_path)
+        try:
+            audio, audio_length = self.get_wav_from_filepath(audio_file_path)
+        except Exception as e:
+            print(f"******** {audio_file_path}: {str(e)} *******")
+            audio, audio_length = None, None
 
         return {
             "audio": audio,
@@ -58,8 +62,10 @@ class AudioDataset(Dataset):
         audio_lengths = []
         audio_file_paths = []
         rel_audio_paths = []
-        max_audio_length = max(item["audio_length"].item() for item in batch)
+        max_audio_length = max(item["audio_length"].item() for item in batch if item["audio"] is not None)
         for item in batch:
+            if item["audio"] is None:
+                continue
             audio = torch.nn.functional.pad(item["audio"], (0, max_audio_length - item["audio"].size(0)), value=0)
             audios_padded.append(audio)
             audio_lengths.append(item["audio_length"])
