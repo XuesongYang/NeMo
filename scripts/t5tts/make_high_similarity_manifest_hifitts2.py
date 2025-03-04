@@ -1,48 +1,68 @@
 import argparse
+import gc
 import multiprocessing
 import os
 from collections import defaultdict
+from itertools import islice
 from operator import itemgetter
 from pathlib import Path
 
 import torch
 import tqdm
+from torch.cuda import empty_cache
 
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest, write_manifest
+
+_worker_emb_dir = None
+
+
+def init_worker(embeddings_save_dir):
+    """Initialize worker with embeddings directory"""
+    global _worker_emb_dir
+    _worker_emb_dir = Path(embeddings_save_dir)
+
+
+def chunked_data_generator(data, chunk_size=1000):
+    """Generate data in chunks to reduce memory pressure"""
+    _it = iter(data)
+    while _chunk := list(islice(_it, chunk_size)):
+        yield _chunk
 
 
 def find_and_add_best_candidate(entry):
     """
-    Find the best candidate for a given record from a list of candidate records, in terms of cosine similarity of embeddings.
+    Find the best candidate for a given record from a list of candidate records that has max cosine similarity.
     Returns best candidate record.
     """
-    _record, _candidate_records, _embeddings_save_dir = entry
+    global _worker_emb_dir
+    _record, _candidate_records = entry
+
+    # Load record embedding
     record_rel_audio_filepath = _record['audio_filepath']
-    record_embedding_fp = (_embeddings_save_dir / record_rel_audio_filepath).with_suffix(".pt")
-    record_embedding = torch.load(record_embedding_fp)
-    # Code is faster on CPU for small number of candidate records
-    # record_embedding = record_embedding.cuda()
+    record_embedding_fp = (_worker_emb_dir / record_rel_audio_filepath).with_suffix(".pt")
+    record_embedding = torch.load(record_embedding_fp, map_location="cpu")
 
     cand_embeddings = []
     for candidate_record in _candidate_records:
         candidate_rel_audio_filepath = candidate_record['audio_filepath']
-        cand_embedding_fp = (_embeddings_save_dir / candidate_rel_audio_filepath).with_suffix(".pt")
-        cand_embedding = torch.load(cand_embedding_fp)
+        cand_embedding_fp = (_worker_emb_dir / candidate_rel_audio_filepath).with_suffix(".pt")
+        cand_embedding = torch.load(cand_embedding_fp, map_location="cpu")
         cand_embeddings.append(cand_embedding)
 
+    # Compute similarities
     cand_embeddings = torch.stack(cand_embeddings)
-    # cand_embeddings = cand_embeddings.cuda()
-
     with torch.no_grad():
         similarities = torch.nn.functional.cosine_similarity(record_embedding.unsqueeze(0), cand_embeddings, dim=1)
 
-    similarity_and_records = []
-    for cidx, candidate_record in enumerate(_candidate_records):
-        similarity_and_records.append((similarities[cidx].item(), candidate_record))
+    max_sim, max_idx = torch.max(similarities, dim=0)
+    _best_similarity = max_sim.item()
+    _best_candidate_record = _candidate_records[max_idx]
 
-    similarity_and_records.sort(key=lambda x: x[0], reverse=True)
-    _best_similarity, _best_candidate_record = similarity_and_records[0]
+    # Explicit memory cleanup
+    del record_embedding, cand_embeddings, similarities
+    empty_cache() if torch.cuda.is_available() else gc.collect()
 
+    # Update record
     _record.update(
         {
             "context_speaker_similarity": _best_similarity,
@@ -71,17 +91,11 @@ if __name__ == "__main__":
     parser.add_argument("--context_min_duration", type=float, default=5.0)
     args = parser.parse_args()
 
-    manifest = args.manifest
-    context_min_duration = args.context_min_duration
-    embeddings_save_dir = Path(args.embeddings_save_dir)
-    n_candidates_per_record = args.n_candidates_per_record
-    cpu_cores = args.cpu_cores
-
     print("Reading manifest...")
     records = read_manifest(args.manifest)
 
-    print(f"Processing {len(records)} records...")
-
+    # Grouping speakers
+    print(f"Organizing speaker records...")
     speaker_records = defaultdict(list)
     # HiFiTTS-2: {speaker_id}/{book_id}/{speaker_id}_{book_id}_{chapter_str}_{utterance_id}.wav
     # re-organize records into a dict like {"some_speaker_id": list()}
@@ -93,44 +107,53 @@ if __name__ == "__main__":
         utterance = int(parts[-1])
         speaker_records[speaker].append((book, chapter, utterance, record))
 
-    # Sort context audio candidates in the order of (book, chapter, utterance)
+    # Sort context audio candidates per speaker by (book, chapter, utterance)
     for speaker in speaker_records:
         speaker_records[speaker].sort(key=itemgetter(0, 1, 2))
         # replace tuples with just the record
         speaker_records[speaker] = [item[-1] for item in speaker_records[speaker]]
 
-    # choose limited amount of candidates
-    data_list = list()
-    for record in tqdm.tqdm(records):
-        speaker = os.path.basename(record["audio_filepath"]).split("_", 1)[0]
+    # choose limited amount of candidates. Generator-based.
+    def generate_data():
+        for _record in records:
+            _speaker = os.path.basename(_record["audio_filepath"]).split("_", 1)[0]
 
-        candidates = list()
-        for item in speaker_records[speaker]:
-            if item != record and item["duration"] < context_min_duration:
+            _candidates = list()
+            for _item in speaker_records[_speaker]:
+                if _item != _record and _item["duration"] < args.context_min_duration:
+                    continue
+                _candidates.append(_item)
+
+            if len(_candidates) == 0:
+                raise ValueError(
+                    "This should not happen because there should be at least 1 item in candidates, which is the record itself."
+                )
+
+            # skip the record that does not have any candidates.
+            if len(_candidates) == 1 and _record == _candidates[0]:
                 continue
-            candidates.append(item)
 
-        if len(candidates) == 0:
-            continue
-
-        if len(candidates) == 1 and record == candidates[0]:
-            continue
-
-        record_pos = candidates.index(record)
-        start = max(0, record_pos - int(n_candidates_per_record / 2))
-        end = min(len(candidates), n_candidates_per_record - start + 1)
-        final_candidates = candidates[start:record_pos] + candidates[record_pos + 1 : end]
-        data_list.append((record, final_candidates, embeddings_save_dir))
+            _record_pos = _candidates.index(_record)
+            _start = max(0, _record_pos - args.n_candidates_per_record // 2)
+            _end = _start + args.n_candidates_per_record
+            # remove record itself from the candidates.
+            _final_candidates = _candidates[_start:_record_pos] + _candidates[_record_pos + 1 : _end]
+            yield _record, _final_candidates
 
     # find high similar context audio using multiple cpu cores.
-    pool = multiprocessing.Pool(processes=cpu_cores)
-    records_new = pool.map(find_and_add_best_candidate, data_list)
-    pool.close()
-    pool.join()
+    with multiprocessing.Pool(
+        processes=args.cpu_cores, initializer=init_worker, initargs=(args.embeddings_save_dir,)
+    ) as pool:
+        records_new = list()
+        chunk_generator = chunked_data_generator(generate_data(), chunk_size=1_000)
+        for chunk in tqdm.tqdm(chunk_generator, desc="Processing chunks"):
+            results = pool.imap(find_and_add_best_candidate, chunk)
+            records_new.extend(results)
+            # clean memory after processing each chunk
+            gc.collect()
 
-    # do not filter by min SSIM. Better add such filter during model training.
-    out_manifest_path = manifest.replace(".json", f"_withContextAudioMinDur{int(context_min_duration)}.json")
+    # Save results: this script only filter records in min dur of context audio. We should apply SSIM filter separately if needed.
+    out_manifest_path = args.manifest.replace(".json", f"_withContextAudioMinDur{int(args.context_min_duration)}.json")
     write_manifest(out_manifest_path, records_new)
-    print("Length of original manifest: ", len(records))
-    print("Length of filtered manifest: ", len(records_new))
-    print("Written to ", out_manifest_path)
+    print(f"Processed {len(records_new)}/{len(records)} records.")
+    print(f"Output manifest: {out_manifest_path}")
