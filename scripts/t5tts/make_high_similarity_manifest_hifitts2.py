@@ -1,5 +1,6 @@
 import argparse
 import gc
+import json
 import multiprocessing
 import os
 from collections import defaultdict
@@ -140,20 +141,25 @@ if __name__ == "__main__":
             _final_candidates = _candidates[_start:_record_pos] + _candidates[_record_pos + 1 : _end]
             yield _record, _final_candidates
 
-    # find high similar context audio using multiple cpu cores.
-    with multiprocessing.Pool(
-        processes=args.cpu_cores, initializer=init_worker, initargs=(args.embeddings_save_dir,)
-    ) as pool:
-        records_new = list()
-        chunk_generator = chunked_data_generator(generate_data(), chunk_size=1_000)
-        for chunk in tqdm.tqdm(chunk_generator, desc="Processing chunks"):
-            results = pool.imap(find_and_add_best_candidate, chunk)
-            records_new.extend(results)
-            # clean memory after processing each chunk
-            gc.collect()
+    out_manifest_path = args.manifest.replace(".json", f"_withContextAudioMinDur{int(args.context_min_duration)}.json")
+    with open(out_manifest_path, "w", encoding="utf-8") as fout:
+        # find high similar context audio using multiple cpu cores.
+        with multiprocessing.Pool(
+            processes=args.cpu_cores, initializer=init_worker, initargs=(args.embeddings_save_dir,)
+        ) as pool:
+            chunk_generator = chunked_data_generator(generate_data(), chunk_size=1_000)
+            processed_count = 0
+            for chunk in tqdm.tqdm(chunk_generator, desc="Processing chunks"):
+                results = pool.imap(find_and_add_best_candidate, chunk)
+                for res in results:
+                    fout.write(f"{json.dumps(res)}\n")
+                    processed_count += 1
+
+                # clean memory after processing each chunk
+                fout.flush()
+                os.fsync(fout.fileno())
+                gc.collect()
 
     # Save results: this script only filter records in min dur of context audio. We should apply SSIM filter separately if needed.
-    out_manifest_path = args.manifest.replace(".json", f"_withContextAudioMinDur{int(args.context_min_duration)}.json")
-    write_manifest(out_manifest_path, records_new)
-    print(f"Processed {len(records_new)}/{len(records)} records.")
+    print(f"Processed {len(processed_count)}/{len(records)} records.")
     print(f"Output manifest: {out_manifest_path}")
