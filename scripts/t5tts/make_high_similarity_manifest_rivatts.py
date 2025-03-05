@@ -130,5 +130,5 @@ if __name__ == "__main__":
                 gc.collect()
 
     # Save results: this script only filter records in min dur of context audio. We should apply SSIM filter separately if needed.
-    print(f"Processed {len(processed_count)}/{len(records)} records.")
+    print(f"Processed {processed_count}/{len(records)} records.")
     print(f"Output manifest: {out_manifest_path}")
