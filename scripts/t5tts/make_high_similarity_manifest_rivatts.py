@@ -102,12 +102,22 @@ if __name__ == "__main__":
 
     def generate_data():
         for _record in records:
-            if _record not in candidates:
-                _final_candidates = candidates
+            parent_dir = os.path.dirname(_record["audio_filepath"])
+            _candidates_with_same_parent_dir = [
+                x for x in candidates if os.path.dirname(x["audio_filepath"]) == parent_dir
+            ]
+            if len(_candidates_with_same_parent_dir) == 0:
+                print(f"Skip record that has no context audio: {_record}")
+                continue
+            if _record not in _candidates_with_same_parent_dir:
+                _final_candidates = _candidates_with_same_parent_dir
             else:
-                _record_pos = candidates.index(_record)
+                _record_pos = _candidates_with_same_parent_dir.index(_record)
                 # remove record itself from the candidates.
-                _final_candidates = candidates[:_record_pos] + candidates[_record_pos + 1 :]
+                _final_candidates = (
+                    _candidates_with_same_parent_dir[:_record_pos]
+                    + _candidates_with_same_parent_dir[_record_pos + 1 :]
+                )
             yield _record, _final_candidates
 
     out_manifest_path = args.manifest.replace(".json", f"_withContextAudioMinDur{int(args.context_min_duration)}.json")
@@ -130,5 +140,5 @@ if __name__ == "__main__":
                 gc.collect()
 
     # Save results: this script only filter records in min dur of context audio. We should apply SSIM filter separately if needed.
-    print(f"Processed {len(processed_count)}/{len(records)} records.")
+    print(f"Processed {processed_count}/{len(records)} records.")
     print(f"Output manifest: {out_manifest_path}")
