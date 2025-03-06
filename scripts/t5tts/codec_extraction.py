@@ -139,8 +139,11 @@ def prepare_directories(base_save_dir, codec_model_name, manifests, dataset_name
         for file_path in file_list:
             dir_path = os.path.dirname(file_path)
             out_dir_path = os.path.join(save_dir, dataset_names[midx], dir_path)
-            if not os.path.exists(out_dir_path):
-                os.makedirs(out_dir_path, exist_ok=True)
+            if not os.path.isdir(out_dir_path):
+                try:
+                    os.makedirs(out_dir_path, exist_ok=True)
+                except FileExistsError:
+                    pass  # Directory already exists, continue with the script
     print("Created directories for saving audio codes at: ", save_dir, len(file_lists))
     return save_dir, file_lists
 
