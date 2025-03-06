@@ -1,19 +1,20 @@
-import json
-import torch
-from torch.utils.data import Dataset, DataLoader
+import argparse
+import os
+
 import pytorch_lightning as pl
+import torch
 from pytorch_lightning import Trainer
 from pytorch_lightning.strategies import DDPStrategy
-from nemo.collections.tts.models import AudioCodecModel
-import os
-from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
-import argparse
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from torch.utils.data import DataLoader, Dataset
+
+from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
+from nemo.collections.asr.parts.utils.manifest_utils import read_manifest, write_manifest
+from nemo.collections.tts.models import AudioCodecModel
+
 
 class AudioDataset(Dataset):
     def __init__(self, file_lists, base_audio_dirs, dataset_names, out_dir, sample_rate=22050, pad_multiple=1024):
-        self.file_list = file_lists
-        self.base_audio_dirs = base_audio_dirs
         self.sample_rate = sample_rate
         self.pad_multiple = pad_multiple
         self.out_dir = out_dir
@@ -21,61 +22,62 @@ class AudioDataset(Dataset):
         for fidx, file_list in enumerate(file_lists):
             base_audio_dir = base_audio_dirs[fidx]
             dataset_name = dataset_names[fidx]
-            for file_path in file_list:
-                audio_file_path = os.path.join(base_audio_dir, file_path)
-                self.combined_file_list.append({
-                    "file_path": file_path,
-                    "audio_file_path": audio_file_path,
-                    "dataset_name": dataset_name
-                })
+            self.combined_file_list.extend(
+                [
+                    {
+                        "file_path": file_path,
+                        "audio_filepath": os.path.join(base_audio_dir, file_path),
+                        "dataset_name": dataset_name,
+                    }
+                    for file_path in file_list
+                ]
+            )
 
     def __len__(self):
         return len(self.combined_file_list)
 
     def get_wav_from_filepath(self, file_path):
         features = AudioSegment.segment_from_file(
-            file_path, target_sr=self.sample_rate, n_segments=-1, trim=False,
+            file_path,
+            target_sr=self.sample_rate,
+            n_segments=-1,
+            trim=False,
         )
-        audio_samples = features.samples
-        audio = torch.tensor(audio_samples)
+        audio = torch.tensor(features.samples)
         audio = torch.nn.functional.pad(audio, (0, self.pad_multiple - audio.size(0) % self.pad_multiple), value=0)
         audio_length = torch.tensor(audio.size(0)).long()
         return audio, audio_length
 
     def __getitem__(self, idx):
-        file_path = self.combined_file_list[idx]["file_path"]
-        audio_file_path = self.combined_file_list[idx]["audio_file_path"]
-        dataset_name = self.combined_file_list[idx]["dataset_name"]
-        assert not file_path.startswith("/"), "file_path should be relative"
-        audio, audio_length = self.get_wav_from_filepath(audio_file_path)
-        codec_file_path_rel = file_path.replace(".wav", ".pt").replace(".flac", ".pt")
+        item = self.combined_file_list[idx]
+        assert not item["file_path"].startswith("/"), "file_path should be relative"
+        audio, audio_length = self.get_wav_from_filepath(item["audio_filepath"])
+        codec_file_path_rel = item["file_path"].replace(".wav", ".pt").replace(".flac", ".pt")
         return {
             "audio": audio,
             "audio_length": audio_length,
-            "file_path": file_path,
-            "codec_file_path": os.path.join(self.out_dir, dataset_name, codec_file_path_rel)
+            "file_path": item["file_path"],
+            "codec_filepath": os.path.join(self.out_dir, item["dataset_name"], codec_file_path_rel),
         }
-    
+
     def collate_fn(self, batch):
         audios_padded = []
         audio_lengths = []
         file_paths = []
-        codec_file_paths = []
+        codec_filepaths = []
         max_audio_length = max(item["audio_length"].item() for item in batch)
         for item in batch:
-            audio = torch.nn.functional.pad(
-                item["audio"], (0, max_audio_length - item["audio"].size(0)), value=0
-            )
+            audio = torch.nn.functional.pad(item["audio"], (0, max_audio_length - item["audio"].size(0)), value=0)
             audios_padded.append(audio)
             audio_lengths.append(item["audio_length"])
             file_paths.append(item["file_path"])
-            codec_file_paths.append(item["codec_file_path"])
-        
+            codec_filepaths.append(item["codec_filepath"])
+
         return {
             "audios": torch.stack(audios_padded),
             "audio_lengths": torch.stack(audio_lengths),
             "audio_file_paths": file_paths,
-            "codec_file_paths": codec_file_paths
+            "codec_filepaths": codec_filepaths,
         }
 
 
@@ -92,52 +94,43 @@ class CodecExtractor(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         codes, codes_lengths = self(batch)
-        for i, file_path in enumerate(batch["codec_file_paths"]):
+        for i, file_path in enumerate(batch["codec_filepaths"]):
             # get directory from file path
-            item_codes = codes[i, :, :codes_lengths[i]] # 8, T
+            item_codes = codes[i, :, : codes_lengths[i]]  # 8, T
             torch.save(item_codes.cpu().type(torch.int16), file_path)
         return None
 
-def read_manifest(manifest_path):
-    records = []
-    with open(manifest_path, 'r') as f:
-        all_lines = f.readlines()
-        for line in all_lines:
-            line = line.strip()
-            record = json.loads(line)
-            records.append(record)
-    return records
-
-def write_manifest(manifest_path, records):
-    with open(manifest_path, 'w') as f:
-        file_str = ""
-        for record in records:
-            file_str += json.dumps(record) + "\n"
-        file_str = file_str.strip()
-        f.write(file_str)
-        print("Wrote {} records to: {}".format(len(records), manifest_path))
 
 @rank_zero_only
 def update_manifests(manifests, save_dir, dataset_names, codec_model_name):
     for midx, manifest in enumerate(manifests):
         records = read_manifest(manifest)
         for ridx, record in enumerate(records):
-            audio_codes_path = record["audio_filepath"].replace(".wav", ".pt").replace(".flac", ".pt")
-            audio_codes_path = os.path.join(save_dir, dataset_names[midx], audio_codes_path)
+            audio_codes_path = os.path.join(
+                save_dir, dataset_names[midx], record["audio_filepath"].replace(".wav", ".pt").replace(".flac", ".pt")
+            )
             record["target_audio_codes_path"] = audio_codes_path
             if ridx % 10 == 0:
                 assert os.path.exists(audio_codes_path), "Audio codes not found: {}".format(audio_codes_path)
 
             if "context_audio_filepath" in record:
-                context_audio_codes_path = record["context_audio_filepath"].replace(".wav", ".pt").replace(".flac", ".pt")
-                context_audio_codes_path = os.path.join(save_dir, dataset_names[midx], context_audio_codes_path)
+                context_audio_codes_path = os.path.join(
+                    save_dir,
+                    dataset_names[midx],
+                    record["context_audio_filepath"].replace(".wav", ".pt").replace(".flac", ".pt"),
+                )
                 record["context_audio_codes_path"] = context_audio_codes_path
                 if ridx % 10 == 0:
-                    assert os.path.exists(context_audio_codes_path), "Context audio codes not found: {}".format(context_audio_codes_path)
-        
-        write_manifest(manifest.replace(".json", "_withAudioCodes_{}.json".format(codec_model_name)), records)
+                    assert os.path.exists(context_audio_codes_path), "Context audio codes not found: {}".format(
+                        context_audio_codes_path
+                    )
 
-def prepare_directories(base_save_dir, codec_model_name, manifests, audio_base_dirs, dataset_names):
+        write_manifest(
+            manifest.replace(".json", "_withAudioCodes_{}.json".format(codec_model_name)), records, ensure_ascii=False
+        )
+
+
+def prepare_directories(base_save_dir, codec_model_name, manifests, dataset_names):
     print("In prepare_directories")
     save_dir = os.path.join(base_save_dir, codec_model_name)
     file_lists = []
@@ -157,6 +150,7 @@ def prepare_directories(base_save_dir, codec_model_name, manifests, audio_base_d
                 os.makedirs(out_dir_path, exist_ok=True)
     print("Created directories for saving audio codes at: ", save_dir, len(file_lists))
     return save_dir, file_lists
+
 
 if __name__ == "__main__":
     """
@@ -197,7 +191,7 @@ if __name__ == "__main__":
         max_epochs=1,
         logger=False,
     )
-    
+
     audio_base_dirs = args.audio_base_dirs.split(",")
     dataset_names = args.dataset_names.split(",")
     manifests = args.manifests.split(",")
@@ -205,26 +199,14 @@ if __name__ == "__main__":
     if torch.distributed.is_initialized():
         rank = torch.distributed.get_rank()
         if rank == 0:
-            save_dir, file_lists = prepare_directories(
-                args.save_dir,
-                args.codec_model_name,
-                manifests,
-                audio_base_dirs,
-                dataset_names
-            )
+            save_dir, file_lists = prepare_directories(args.save_dir, args.codec_model_name, manifests, dataset_names)
             results = [save_dir, file_lists]
         else:
             results = [None, None]
         torch.distributed.broadcast_object(results, src=0)
         save_dir, file_lists = results
     else:
-        save_dir, file_lists = prepare_directories(
-            args.save_dir,
-            args.codec_model_name,
-            manifests,
-            audio_base_dirs,
-            dataset_names
-        )
+        save_dir, file_lists = prepare_directories(args.save_dir, args.codec_model_name, manifests, dataset_names)
 
     codec_extractor = CodecExtractor(args.codec_model_path)
 
