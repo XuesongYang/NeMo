@@ -87,10 +87,17 @@ def get_recording_id(audio_base_dir, path):
 
 class SharPredictionWriter(BasePredictionWriter):
     def __init__(
-        self, output_dir: str, codec_frame_rate: float, audio_base_dir: str, fields: dict, shard_size: int = 1000
+        self,
+        output_dir: str,
+        codec_model_name: str,
+        codec_frame_rate: float,
+        audio_base_dir: str,
+        fields: dict,
+        shard_size: int = 1000,
     ):
         super().__init__(write_interval="batch")
         self.output_dir = output_dir
+        self.codec_model_name = codec_model_name
         self.codec_frame_rate = codec_frame_rate
         self.fields = fields
         self.shard_size = shard_size
@@ -200,10 +207,16 @@ class SharPredictionWriter(BasePredictionWriter):
             )
             # attach audio codec codes numpy arrays here.
             cut = cut.attach_tensor(
-                name="codes", data=target_codes[idx], temporal_dim=1, frame_shift=1 / self.codec_frame_rate
+                name=f"codes_{self.codec_model_name}",
+                data=target_codes[idx],
+                temporal_dim=1,
+                frame_shift=1 / self.codec_frame_rate,
             )
             cut = cut.attach_tensor(
-                name="context_codes", data=context_codes[idx], temporal_dim=1, frame_shift=1 / self.codec_frame_rate
+                name=f"context_codes_{self.codec_model_name}",
+                data=context_codes[idx],
+                temporal_dim=1,
+                frame_shift=1 / self.codec_frame_rate,
             )
             cuts.append(cut)
 
@@ -360,15 +373,16 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", type=str)
     parser.add_argument("--audio_base_dir", type=str)
     parser.add_argument("--save_dir", type=str)
+    parser.add_argument("--codec_model_name", type=str, default="21fpsCausalDecoder")
     parser.add_argument("--codec_model_path", type=str)
     parser.add_argument("--codec_frame_rate", type=float, default=21.5)
-    parser.add_argument("--sample_rate", type=int, default=22050)
     parser.add_argument("--pad_multiple", type=int, default=1024)
+    parser.add_argument("--sample_rate", type=int, default=22050)
     parser.add_argument("--devices", type=int, default=-1)
     parser.add_argument("--num_nodes", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=48)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--shard_size", type=int, default=2048)
+    parser.add_argument("--shard_size", type=int, default=4096)
     args = parser.parse_args()
 
     codec_extractor = CodecExtractor(args.codec_model_path)
@@ -386,12 +400,13 @@ if __name__ == "__main__":
     # Note that context_recording would be stored using AudioTarWriter.
     pred_writer = SharPredictionWriter(
         output_dir=args.save_dir,
+        codec_model_name=args.codec_model_name,
         audio_base_dir=args.audio_base_dir,
         codec_frame_rate=args.codec_frame_rate,
         fields={
             "recording": "flac",
-            "codes": "numpy",
-            "context_codes": "numpy",
+            f"codes_{args.codec_model_name}": "numpy",
+            f"context_codes_{args.codec_model_name}": "numpy",
         },
         shard_size=args.shard_size,
     )
