@@ -440,7 +440,7 @@ class T5TTSDataset(TextToSpeechDataset):
                 start_idx = random.randint(0, context_audio_codes.shape[1] - _num_frames_to_slice)
                 context_audio_codes = context_audio_codes[:, start_idx:start_idx+_num_frames_to_slice]
             else:
-                # Repeaet the audio if it is shorter than the desired duration
+                # Repeat the audio if it is shorter than the desired duration
                 _num_repeats = int(np.ceil(_num_frames_to_slice / context_audio_codes.shape[1]))
                 # context_audio_codes is a tensor of shape (num_codebooks, T)
                 context_audio_codes_repeated = context_audio_codes.repeat(1, _num_repeats)
@@ -463,7 +463,7 @@ class T5TTSDataset(TextToSpeechDataset):
                 start_idx = random.randint(0, len(context_audio_array) - _num_samples_to_slice)
                 context_audio_array = context_audio_array[start_idx:start_idx+_num_samples_to_slice]
             else:
-                # Repeaet the audio if it is shorter than the desired duration
+                # Repeat the audio if it is shorter than the desired duration
                 _num_repeats = int(np.ceil(_num_samples_to_slice / len(context_audio_array)))
                 context_audio_array = np.tile(context_audio_array, _num_repeats)
                 context_audio_array = context_audio_array[:_num_samples_to_slice]
@@ -475,6 +475,13 @@ class T5TTSDataset(TextToSpeechDataset):
             # We always want to have context_audio_codes if available for multi-encoder model. These are ignored for singlencoder model.
             # If context audio is not available, just use a dummy context_audio_codes
             # (Will be used in text context scenario)
+            # TODO @xueyang: verified that this block should cover below 3 conditions which were handled well.
+            #  1. load_cached_codes_if_available and ["context_audio_codes_path", "context_audio_filepath"] not in data.manifest_entry;
+            #        assign to example["context_audio_codes"] and example["context_audio_codes_len"]
+            #  2. load_cached_codes_if_available is not True and "context_audio_codes_path" in data.manifest_entry;
+            #        assign to example["context_audio"] and example["context_audio_len"]
+            #  3. load_cached_codes_if_available is not True and ["context_audio_codes_path", "context_audio_filepath"] not in data.manifest_entry;
+            #        assign to example["context_audio"] and example["context_audio_len"]
             if self.load_cached_codes_if_available:
                 context_bos_tensor = torch.full((self.num_audio_codebooks, 1), self.context_audio_bos_id, dtype=torch.int32)
                 context_eos_tensor = torch.full((self.num_audio_codebooks, 1), self.context_audio_eos_id, dtype=torch.int32)
@@ -526,6 +533,9 @@ class T5TTSDataset(TextToSpeechDataset):
                     _pad_id = self.text_conditioning_tokenizer.pad_token_id
                     context_tokens += [_pad_id] * (_required_len - len(context_tokens))
                 else:
+                    # TODO @xueyang: It seems counter intuition if trimming the text context tokens to the required
+                    #  context length. For example, the context_tokens after trimming may correspond to the partial
+                    #  context_text like "Speaker and Emotion: | Language:en Dataset(trimmed :Riva Speaker:Rodney_DROP |)"
                     context_tokens = context_tokens[:_required_len]
 
             context_tokens = torch.tensor(context_tokens, dtype=torch.int32)
