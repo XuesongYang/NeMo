@@ -57,7 +57,7 @@ import argparse
 import os
 import re
 from functools import partial
-
+from pathlib import Path
 import pytorch_lightning as pl
 import torch
 from lhotse import MonoCut, Recording, SupervisionSegment
@@ -80,7 +80,7 @@ def check_speaker_format(item: str):
     return bool(re.match(pattern, item))
 
 
-def get_recording_id(audio_base_dir, path):
+def get_recording_id(audio_base_dir: str, path: Path):
     # the recording id is defined as the concatenation of relative audio filepath with a hyphen delimiter.
     return path.relative_to(audio_base_dir).with_suffix("").as_posix().replace("/", "-")
 
@@ -175,12 +175,16 @@ class SharPredictionWriter(BasePredictionWriter):
         for idx, target_audio_filepath in enumerate(target_audio_filepaths):
             # context recording
             context_recording = Recording.from_file(
-                path=context_audio_filepaths[idx], recording_id=self.recording_id_fn
+                path=context_audio_filepaths[idx],
+                recording_id=self.recording_id_fn,
             )
             context_recordings.append(context_recording)
 
             # target recording
-            target_recording = Recording.from_file(path=target_audio_filepath, recording_id=self.recording_id_fn)
+            target_recording = Recording.from_file(
+                path=target_audio_filepath,
+                recording_id=self.recording_id_fn,
+            )
             target_recording_id = target_recording.id
             target_duration = target_recording.duration
 
@@ -204,6 +208,7 @@ class SharPredictionWriter(BasePredictionWriter):
                 recording=target_recording,
                 channel=0,
                 supervisions=[supervision],
+                custom={"context_recording": context_recording},
             )
             # attach audio codec codes numpy arrays here.
             cut = cut.attach_tensor(
