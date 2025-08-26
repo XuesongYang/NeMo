@@ -19,11 +19,17 @@ import nemo_run as run
 
 from nemo.collections.llm.recipes.mixtral_8x7b import pretrain_recipe
 from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
-from nemo.lightning.run.plugins import MemoryProfilePlugin, NsysPlugin, PerfEnvPlugin
+from nemo.lightning.run.plugins import MemoryProfilePlugin, NsysPlugin
 
 from ..argument_parser import parse_cli_args
 from ..executors import slurm_executor
-from ..helpers import args_sanity_check, get_user_configs, set_exp_logging_configs, set_primary_perf_configs
+from ..helpers import (
+    args_sanity_check,
+    build_perf_env_plugin,
+    get_user_configs,
+    set_exp_logging_configs,
+    set_primary_perf_configs,
+)
 from ..utils import hf_tokenizer
 
 
@@ -61,6 +67,8 @@ def override_recipe_configs(
         ep_size,
         etp_size,
         enable_cuda_graphs,
+        use_mcore_fsdp=args.use_mcore_fsdp,
+        use_fsdp_double_buffer=args.use_fsdp_double_buffer,
         use_user_buffer_registration=args.use_user_buffer_registration,
         use_sharp=args.use_sharp,
         compute_dtype=args.compute_dtype,
@@ -116,13 +124,7 @@ if __name__ == "__main__":
         network='sharp' if args.use_sharp else None,
     )
 
-    plugins = [
-        PerfEnvPlugin(
-            enable_vboost=True,
-            nccl_pp_comm_chunksize=2097152 if pp_size > 1 else None,
-            gpu_sm100_or_newer=(args.gpu.lower() in ['b200', 'gb200']),
-        )
-    ]
+    plugins = [build_perf_env_plugin(args, pp_size=pp_size)]
     if args.enable_nsys:
         plugins.append(NsysPlugin(start_step=5, end_step=6))
     if args.enable_memory_profile:
