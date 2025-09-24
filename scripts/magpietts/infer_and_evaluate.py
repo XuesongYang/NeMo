@@ -516,12 +516,12 @@ def run_inference(
             test_dataset.text_tokenizer = model.tokenizer
             # Set phoneme prob = 1 for g2p
             g2p = None
-            if isinstance(model.tokenizer, AggregatedTTSTokenizer):
-                g2p = model.tokenizer.tokenizers["english_phoneme"].g2p
-            elif isinstance(model.tokenizer, IPATokenizer):
-                g2p = model.tokenizer.g2p
-            if g2p is not None:
-                g2p.phoneme_probability = 1.0
+            # if isinstance(model.tokenizer, AggregatedTTSTokenizer):
+            #     g2p = model.tokenizer.tokenizers["english_phoneme"].g2p
+            # elif isinstance(model.tokenizer, IPATokenizer):
+            #     g2p = model.tokenizer.g2p
+            # if g2p is not None:
+            #     g2p.phoneme_probability = 1.0
 
             test_data_loader = torch.utils.data.DataLoader(
                 test_dataset,

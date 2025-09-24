@@ -53,4 +53,64 @@ dataset_meta_info = {
         'audio_dir': '/',
         'feature_dir': None,
     },
+
+    ############# ICLR26 #############
+    # full set
+    'CML-TTS_dev_IT_original': {
+        'manifest_path': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/original/CML-TTS_dev/IT/evaluation_manifests/CML-TTS_dev_IT_dev_original_withContextAudioMinDur3.0MinSSIM0.6.json',
+        'audio_dir': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/original/CML-TTS_dev/IT/audio_extracted',
+        'tokenizer_names': ['italian_chartokenizer'],
+        'whisper_language': 'italian',
+    },
+    'CML-TTS_dev_NL_original': {
+        'manifest_path': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/original/CML-TTS_dev/NL/evaluation_manifests/CML-TTS_dev_NL_dev_original_withContextAudioMinDur3.0MinSSIM0.6.json',
+        'audio_dir': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/original/CML-TTS_dev/NL/audio_extracted',
+        'tokenizer_names': ['dutch_chartokenizer'],
+        'whisper_language': 'dutch',
+    },
+    'CML-TTS_dev_IT_enhanced': {
+        'manifest_path': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/enhanced/CML-TTS_dev/IT/evaluation_manifests/CML-TTS_dev_IT_dev_enhanced_withContextAudioMinDur3.0MinSSIM0.6.json',
+        'audio_dir': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/enhanced/CML-TTS_dev/IT/audio_extracted',
+        'tokenizer_names': ['italian_chartokenizer'],
+        'whisper_language': 'italian',
+    },
+    'CML-TTS_dev_NL_enhanced': {
+        'manifest_path': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/enhanced/CML-TTS_dev/NL/evaluation_manifests/CML-TTS_dev_NL_dev_enhanced_withContextAudioMinDur3.0MinSSIM0.6.json',
+        'audio_dir': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/enhanced/CML-TTS_dev/NL/audio_extracted',
+        'tokenizer_names': ['dutch_chartokenizer'],
+        'whisper_language': 'dutch',
+    },
+     'LibriTTS_test_clean_original': {
+        'manifest_path': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/original/LibriTTS_test_clean/LibriTTS_test_clean_withContextAudioPaths.jsonl',
+        'audio_dir': '/mnt/sdb/xueyang_data/LibriTTS',
+        'tokenizer_names': ['english_chartokenizer'],
+        'whisper_language': 'en',
+    },
+
+    # subset with 100 records each.
+    'CML-TTS_dev_IT_original_subset_100': {
+        'manifest_path': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/original/CML-TTS_dev/IT/evaluation_manifests/CML-TTS_dev_IT_dev_original_withContextAudioMinDur3.0MinSSIM0.6_100.json',
+        'audio_dir': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/original/CML-TTS_dev/IT/audio_extracted',
+        'tokenizer_names': ['italian_chartokenizer'],
+        'whisper_language': 'italian',
+    },
+    'CML-TTS_dev_NL_original_subset_100': {
+        'manifest_path': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/original/CML-TTS_dev/NL/evaluation_manifests/CML-TTS_dev_NL_dev_original_withContextAudioMinDur3.0MinSSIM0.6_100.json',
+        'audio_dir': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/original/CML-TTS_dev/NL/audio_extracted',
+        'tokenizer_names': ['dutch_chartokenizer'],
+        'whisper_language': 'dutch',
+    },
+    'CML-TTS_dev_IT_enhanced_subset_100': {
+        'manifest_path': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/enhanced/CML-TTS_dev/IT/evaluation_manifests/CML-TTS_dev_IT_dev_enhanced_withContextAudioMinDur3.0MinSSIM0.6_100.json',
+        'audio_dir': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/enhanced/CML-TTS_dev/IT/audio_extracted',
+        'tokenizer_names': ['italian_chartokenizer'],
+        'whisper_language': 'italian',
+    },
+    'CML-TTS_dev_NL_enhanced_subset_100': {
+        'manifest_path': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/enhanced/CML-TTS_dev/NL/evaluation_manifests/CML-TTS_dev_NL_dev_enhanced_withContextAudioMinDur3.0MinSSIM0.6_100.json',
+        'audio_dir': '/mnt/sdb/xueyang_data/iclr_2026/data_prep/enhanced/CML-TTS_dev/NL/audio_extracted',
+        'tokenizer_names': ['dutch_chartokenizer'],
+        'whisper_language': 'dutch',
+    },
+
 }
