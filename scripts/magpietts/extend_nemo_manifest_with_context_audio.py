@@ -530,6 +530,8 @@ def _get_parsed_speaker_id_for_dataset(dataset_name_arg, record):
         return _parse_speaker_id_jhsdGtc20Amp20Keynote(record)
     elif dataset_name_arg == "Emilia-YODAS":
         return _parse_speaker_id_nvyt2505(record)
+    elif dataset_name_arg == "CML-TTS":
+        return _parse_speaker_id_nvyt2505(record)
     else:
         logger.error(
             f"Unsupported dataset_name '{dataset_name_arg}' provided. Please check the --dataset-name argument."
@@ -555,7 +557,8 @@ def main():
             "rivaLindyRodney",
             "rivaEmmaMeganSeanTom",
             "jhsdGtc20Amp20Keynote",
-            "Emilia-YODAS"
+            "Emilia-YODAS",
+            "CML-TTS"
         ],
         help="Name of the dataset being processed. This determines the speaker ID parsing logic.",
     )
