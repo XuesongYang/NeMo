@@ -2854,13 +2854,13 @@ class MagpieTTSModel(ModelPT):
 
     def on_validation_epoch_end(self):
         """
-        Extends parent class to compute averaged metrics across all validation dataloaders.
+        Computes and logs averaged metrics across all validation dataloaders.
 
         This method:
-        1. Calls parent to get per-dataloader logging (e.g., "val_set_0/loss")
-        2. Computes averages across all dataloaders
-        3. Logs averaged metrics (e.g., "val/loss")
-        4. Uses averaged val_loss for checkpointing
+        1. Computes per-dataloader metrics from validation outputs.
+        2. Computes averages across all dataloaders.
+        3. Logs both per-dataloader and averaged metrics (e.g., "val_set_0/loss", "val/loss").
+        4. Uses averaged val_loss for checkpointing.
         """
         # Check where we don't provide data loaders.
         if self.validation_step_outputs is None or len(self.validation_step_outputs) == 0:
