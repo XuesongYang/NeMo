@@ -2916,6 +2916,8 @@ class MagpieTTSModel(ModelPT):
             # Compute and log averaged metrics
             if len(all_losses) == 0:
                 raise ValueError("No validation losses collected from any dataloader.")
+            if len(all_codebook_losses) == 0:
+                raise ValueError("No codebook losses collected from any dataloader.")
 
             avg_val_loss = torch.stack(all_losses).mean()
             avg_codebook_loss = torch.stack(all_codebook_losses).mean()
