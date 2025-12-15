@@ -88,7 +88,9 @@ model:
 
   validation_ds:
     # the entries under 'datasets' are a list of separate dataloaders.
-    # The structure is <dataset-name>: {<dataloader-dict-config>}
+    # The structure is:
+    # - name: '<dataset-name>'
+    #   <dataloader-dict-config>
     # They inherit all settings from validation_ds, but can individually override them.
     use_lhotse: ${model.use_lhotse}
     volume_norm: true
