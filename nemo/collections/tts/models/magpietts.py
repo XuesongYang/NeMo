@@ -2948,7 +2948,7 @@ class MagpieTTSModel(ModelPT):
                 sync_dist=True,
                 on_step=False,
                 on_epoch=True,
-                logger=False,  # Don't log to wandb (already logged as "val/loss" above)
+                logger=False,  # Don't log to wandb (already logged as "Loss:val_avg/loss" above)
                 enable_graph=False,
             )
 
