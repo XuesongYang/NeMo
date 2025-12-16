@@ -19,15 +19,17 @@ import time
 from dataclasses import dataclass, field, fields
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import torch
 import wandb
 from hydra.utils import instantiate
+from lhotse.serialization import load_yaml
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from torch import nn
 from torch.utils.data import get_worker_info
 
@@ -1727,7 +1729,7 @@ class MagpieTTSModel(ModelPT):
                         f"Invalid logger type for image logging: {type(logger)}. Only `WandbLogger` and `TensorBoardLogger` are supported."
                     )
 
-                wandb_images_log[f"Image/{prefix}/attention_matrix"] = list()
+                wandb_images_log[f"Image:{prefix}/attention_matrix"] = list()
                 for idx in range(min(3, attention_prob_matrix_mean.size(0))):
                     item_attn_matrix = attention_prob_matrix_mean[idx][
                         dec_context_size : dec_context_size + audio_codes_lens[idx], : text_lens[idx]
@@ -1736,7 +1738,7 @@ class MagpieTTSModel(ModelPT):
                     img_np = plot_alignment_to_numpy(item_attn_matrix.T)
 
                     if is_wandb:
-                        wandb_images_log[f"Image/{prefix}/attention_matrix"].append(
+                        wandb_images_log[f"Image:{prefix}/attention_matrix"].append(
                             wandb.Image(img_np, caption=f"Example_{idx}")
                         )
 
@@ -1757,6 +1759,7 @@ class MagpieTTSModel(ModelPT):
         audio_codes_lens,
         context_audio_codes=None,
         context_audio_codes_lens=None,
+        prefix="val",
     ):
         wandb_audio_log = {}
 
@@ -1798,34 +1801,34 @@ class MagpieTTSModel(ModelPT):
                     context_audio_np = context_audio_np[: context_audio_lens[idx]]
 
                 if is_wandb:
-                    wandb_audio_log[f"Audio/Example_{idx}"] = list()
+                    wandb_audio_log[f"Audio:{prefix}/Example_{idx}"] = list()
                     if context_audio_np is not None:
-                        wandb_audio_log[f"Audio/Example_{idx}"].append(
-                            wandb.Audio(context_audio_np, sample_rate=self.output_sample_rate, caption="context")
+                        wandb_audio_log[f"Audio:{prefix}/Example_{idx}"].append(
+                            wandb.Audio(context_audio_np, sample_rate=self.sample_rate, caption="context")
                         )
-                    wandb_audio_log[f"Audio/Example_{idx}"].append(
-                        wandb.Audio(pred_audio_np, sample_rate=self.output_sample_rate, caption="prediction")
+                    wandb_audio_log[f"Audio:{prefix}/Example_{idx}"].append(
+                        wandb.Audio(pred_audio_np, sample_rate=self.sample_rate, caption="prediction")
                     )
-                    wandb_audio_log[f"Audio/Example_{idx}"].append(
-                        wandb.Audio(target_audio_np, sample_rate=self.output_sample_rate, caption="target")
+                    wandb_audio_log[f"Audio:{prefix}/Example_{idx}"].append(
+                        wandb.Audio(target_audio_np, sample_rate=self.sample_rate, caption="target")
                     )
 
                 if is_tb:
                     if context_audio_np is not None:
                         logger.experiment.add_audio(
-                            f'Example_{idx}/context',
+                            f'{prefix}/Example_{idx}/context',
                             context_audio_np,
                             global_step=self.global_step,
                             sample_rate=self.output_sample_rate,
                         )
                     logger.experiment.add_audio(
-                        f'Example_{idx}/prediction',
+                        f'{prefix}/Example_{idx}/prediction',
                         pred_audio_np,
                         global_step=self.global_step,
                         sample_rate=self.output_sample_rate,
                     )
                     logger.experiment.add_audio(
-                        f'Example_{idx}/target',
+                        f'{prefix}/Example_{idx}/target',
                         target_audio_np,
                         global_step=self.global_step,
                         sample_rate=self.output_sample_rate,
@@ -2568,26 +2571,26 @@ class MagpieTTSModel(ModelPT):
         batch_output = self.process_batch(batch)
         loss = batch_output['loss']
         codebook_loss = batch_output['codebook_loss']
-        self.log('train/codebook_loss', codebook_loss, prog_bar=True, sync_dist=True)
+        self.log('Loss:train/codebook_loss', codebook_loss, prog_bar=True, sync_dist=True)
         if self.cfg_unconditional_prob == 0.0:
             # Only log alignment loss when not using cfg to avoid sync issues when
             # alignment loss is None on some ranks
             alignment_loss = batch_output['alignment_loss']
             if alignment_loss is not None:
-                self.log('train/alignment_loss', alignment_loss, prog_bar=True, sync_dist=True)
-        self.log('train/loss', loss, prog_bar=True, sync_dist=True)
+                self.log('Loss:train/alignment_loss', alignment_loss, prog_bar=True, sync_dist=True)
+        self.log('Loss:train/loss', loss, prog_bar=True, sync_dist=True)
         local_transformer_loss = batch_output['local_transformer_loss']
         if local_transformer_loss is not None:
-            self.log('train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
+            self.log('Loss:train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
 
         # Log batch info
         batch_size, text_token_max_len = batch["text"].shape
         text_token_total_num = batch["text_lens"].sum()
         batch_info_dict = {
-            "train/batch_size": batch_size,
-            "train/text_token_max_len": text_token_max_len,
-            "train/text_token_total_num_in_batch": text_token_total_num.item(),
-            "train/text_token_pad_ratio_percent_in_batch": 100
+            "BatchInfo:train/batch_size": batch_size,
+            "BatchInfo:train/text_token_max_len": text_token_max_len,
+            "BatchInfo:train/text_token_total_num_in_batch": text_token_total_num.item(),
+            "BatchInfo:train/text_token_pad_ratio_percent_in_batch": 100
             * (1 - text_token_total_num / (batch_size * text_token_max_len)),
         }
 
@@ -2596,9 +2599,9 @@ class MagpieTTSModel(ModelPT):
             audio_codes_total_num = batch["audio_codes_lens"].sum()
             batch_info_dict.update(
                 {
-                    "train/audio_codes_max_len": audio_codes_max_len,
-                    "train/audio_codes_total_num_in_batch": audio_codes_total_num.item(),
-                    "train/audio_codes_pad_ratio_percent_in_batch": 100
+                    "BatchInfo:train/audio_codes_max_len": audio_codes_max_len,
+                    "BatchInfo:train/audio_codes_total_num_in_batch": audio_codes_total_num.item(),
+                    "BatchInfo:train/audio_codes_pad_ratio_percent_in_batch": 100
                     * (1 - audio_codes_total_num / (batch_size * audio_codes_max_len)),
                 }
             )
@@ -2607,9 +2610,9 @@ class MagpieTTSModel(ModelPT):
             audio_samples_total_num = batch["audio_lens"].sum()
             batch_info_dict.update(
                 {
-                    "train/audio_samples_max_len": audio_samples_max_len,
-                    "train/audio_samples_total_num_in_batch": audio_samples_total_num.item(),
-                    "train/audio_samples_pad_ratio_percent_in_batch": 100
+                    "BatchInfo:train/audio_samples_max_len": audio_samples_max_len,
+                    "BatchInfo:train/audio_samples_total_num_in_batch": audio_samples_total_num.item(),
+                    "BatchInfo:train/audio_samples_pad_ratio_percent_in_batch": 100
                     * (1 - audio_samples_total_num / (batch_size * audio_samples_max_len)),
                 }
             )
@@ -2618,14 +2621,24 @@ class MagpieTTSModel(ModelPT):
 
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        batch_output = self.process_batch(batch)
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        """
+        Validation step with support for multiple dataloaders.
+
+        Args:
+            batch: Input batch
+            batch_idx: Batch index
+            dataloader_idx: Index of the dataloader (0 for single dataloader)
+        """
+        batch_output = self.process_batch(batch, mode="val")
         # self.process_batch returns a dict. We currently only log "logits" which come from the parallel prediction
         # head. If we use local_transformer, then the local_transformer returns "local_transformer_logits"
+
         loss = batch_output['loss']
         codebook_loss = batch_output['codebook_loss']
         alignment_loss = batch_output['alignment_loss']
         aligner_encoder_loss = batch_output['aligner_encoder_loss']
+        local_transformer_loss = batch_output['local_transformer_loss']
         logits = batch_output['logits']
         audio_codes_target = batch_output['audio_codes_target']
         audio_codes_lens_target = batch_output['audio_codes_lens_target']
@@ -2634,23 +2647,30 @@ class MagpieTTSModel(ModelPT):
         attn_info = batch_output['attn_info']
         text_lens = batch_output['text_lens']
         dec_context_size = batch_output['dec_context_size']
-        if alignment_loss is None:
-            alignment_loss = torch.tensor(0.0, device=loss.device)
-        if aligner_encoder_loss is None:
-            aligner_encoder_loss = torch.tensor(0.0, device=loss.device)
 
+        # Log audio and attention on first batch of all dataloaders
         if batch_idx == 0 and self.global_rank == 0:
+            # Get dataset name for logging prefix
+            dataset_prefix = "val"
+            if self._validation_names is not None:  # indicates multi-dataloader
+                dataset_prefix = self._validation_names[dataloader_idx]
+
             # Prepare dictionary for aggregated wandb logging
             wandb_log_dict = {}
 
-            # Get audio data for logging
+            # Log audio examples with dataset-specific prefix
             wandb_log_dict.update(
                 self.log_val_audio_example(
-                    logits, audio_codes_target, audio_codes_lens_target, context_audio_codes, context_audio_codes_lens
+                    logits,
+                    audio_codes_target,
+                    audio_codes_lens_target,
+                    context_audio_codes,
+                    context_audio_codes_lens,
+                    prefix=dataset_prefix,
                 )
             )
 
-            # Get attention image data for logging
+            # Log attention if available
             if len(attn_info[self.transcript_decoder_layers[0]]['cross_attn_probabilities']) > 1:
                 # cross_attn_probabilities only returned when not using flash attention
                 cross_attention_probs = [
@@ -2663,11 +2683,12 @@ class MagpieTTSModel(ModelPT):
                         cross_attention_probs,
                         audio_codes_lens_target,
                         text_lens,
-                        prefix="val",
+                        prefix=dataset_prefix,
                         dec_context_size=dec_context_size,
                     )
                 )
 
+                # Log per-layer attention
                 for layer_idx in self.transcript_decoder_layers:
                     cross_attention_probs = [attn_info[layer_idx]['cross_attn_probabilities'][0]]
                     wandb_log_dict.update(
@@ -2675,18 +2696,19 @@ class MagpieTTSModel(ModelPT):
                             cross_attention_probs,
                             audio_codes_lens_target,
                             text_lens,
-                            prefix=f"val/layer_{layer_idx}",
+                            prefix=f"{dataset_prefix}/layer_{layer_idx}",
                             dec_context_size=dec_context_size,
                         )
                     )
 
+                # Log aligner attention if available
                 if batch_output['aligner_attn_soft'] is not None:
                     wandb_log_dict.update(
                         self.log_attention_probs(
                             [batch_output['aligner_attn_soft']],
                             audio_codes_lens_target,
                             text_lens,
-                            prefix="val/aligner_encoder_attn",
+                            prefix=f"{dataset_prefix}/aligner_encoder_attn",
                         )
                     )
 
@@ -2696,7 +2718,7 @@ class MagpieTTSModel(ModelPT):
                             [batch_output['aligner_attn_hard'].unsqueeze(1)],
                             audio_codes_lens_target,
                             text_lens,
-                            prefix="val/aligner_encoder_attn_hard",
+                            prefix=f"{dataset_prefix}/aligner_encoder_attn_hard",
                         )
                     )
 
@@ -2705,15 +2727,27 @@ class MagpieTTSModel(ModelPT):
                 if isinstance(logger, WandbLogger) and wandb_log_dict:
                     logger.experiment.log(wandb_log_dict)
 
-        local_transformer_loss = batch_output['local_transformer_loss']
         val_output = {
             'val_loss': loss,
             'val_codebook_loss': codebook_loss,
-            'val_alignment_loss': alignment_loss,
-            'val_local_transformer_loss': local_transformer_loss,
-            'val_aligner_encoder_loss': aligner_encoder_loss,
         }
-        self.validation_step_outputs.append(val_output)
+
+        # Only add optional losses if they were computed (not None)
+        if alignment_loss is not None:
+            val_output['val_alignment_loss'] = alignment_loss
+        if local_transformer_loss is not None:
+            val_output['val_local_transformer_loss'] = local_transformer_loss
+        if aligner_encoder_loss is not None:
+            val_output['val_aligner_encoder_loss'] = aligner_encoder_loss
+
+        # Append to appropriate list based on structure
+        # validation_step_outputs is initialized in ModelPT: [] for single dataloader, [[], [], ...] for multiple dataloaders.
+        if len(self.validation_step_outputs) > 0 and isinstance(self.validation_step_outputs[0], list):
+            # Multiple dataloaders: list of lists
+            self.validation_step_outputs[dataloader_idx].append(val_output)
+        else:
+            # Single dataloader: flat list
+            self.validation_step_outputs.append(val_output)
 
         return val_output
 
@@ -3321,32 +3355,192 @@ class MagpieTTSModel(ModelPT):
                     audio_path = os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}.wav')
                     sf.write(audio_path, predicted_audio_np, self.output_sample_rate)
 
+    def multi_validation_epoch_end(
+        self, outputs: List[Dict[str, torch.Tensor]], dataloader_idx: int = 0
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Called for each validation dataloader at the end of validation epoch.
+        Computes metrics for this specific dataloader.
+
+        Args:
+            outputs: List of outputs from validation_step for this specific dataloader
+            dataloader_idx: Index of the current dataloader
+
+        Returns:
+            Dictionary with metrics to log
+        """
+
+        def collect_required_metric(outputs, key):
+            values = [x[key] for x in outputs if key in x and x[key] is not None]
+            if len(values) == 0:
+                raise ValueError(
+                    f"No valid values found for required metric '{key}' in validation outputs "
+                    f"for dataloader {dataloader_idx}. This indicates an issue with validation."
+                )
+            return torch.stack(values).mean()
+
+        def collect_optional_metric(outputs, key):
+            """Collect optional metric - returns None if not found."""
+            values = [x[key] for x in outputs if key in x and x[key] is not None]
+            if len(values) == 0:
+                return None
+            return torch.stack(values).mean()
+
+        if len(outputs) == 0:
+            raise ValueError(
+                f"No validation outputs for dataloader {dataloader_idx}. "
+                f"This indicates an issue with the validation dataloader or validation step."
+            )
+
+        # Compute required metrics
+        val_loss = collect_required_metric(outputs, 'val_loss')
+        val_codebook_loss = collect_required_metric(outputs, 'val_codebook_loss')
+
+        # Compute optional metrics
+        val_alignment_loss = collect_optional_metric(outputs, 'val_alignment_loss')
+        val_aligner_encoder_loss = collect_optional_metric(outputs, 'val_aligner_encoder_loss')
+        val_local_transformer_loss = collect_optional_metric(outputs, 'val_local_transformer_loss')
+
+        # Prepare log dict - only include metrics that were computed
+        log_dict = {
+            'loss': val_loss,
+            'codebook_loss': val_codebook_loss,
+        }
+
+        # Add optional metrics if they were computed
+        if val_alignment_loss is not None:
+            log_dict['alignment_loss'] = val_alignment_loss
+        if val_aligner_encoder_loss is not None:
+            log_dict['aligner_encoder_loss'] = val_aligner_encoder_loss
+        if val_local_transformer_loss is not None:
+            log_dict['local_transformer_loss'] = val_local_transformer_loss
+
+        return log_dict
+
     def on_validation_epoch_end(self):
-        collect = lambda key: torch.stack([x[key] for x in self.validation_step_outputs]).mean()
-        val_loss = collect("val_loss")
-        val_codebook_loss = collect("val_codebook_loss")
-        val_alignment_loss = collect("val_alignment_loss")
-        val_aligner_encoder_loss = collect("val_aligner_encoder_loss")
-        # log val_loss in the same group as the other val metrics.
-        self.log("val/loss", val_loss, prog_bar=True, sync_dist=True)
-        # ensure val_loss is available for epoch-level checkpointing and filename generation without cluttering wandb logs.
-        self.log(
-            "val_loss",
-            val_loss,
-            prog_bar=False,
-            sync_dist=True,
-            on_step=False,
-            on_epoch=True,
-            logger=False,
-            enable_graph=False,
-        )
-        self.log("val/codebook_loss", val_codebook_loss, prog_bar=True, sync_dist=True)
-        self.log("val/alignment_loss", val_alignment_loss, prog_bar=True, sync_dist=True)
-        self.log("val/aligner_encoder_loss", val_aligner_encoder_loss, prog_bar=True, sync_dist=True)
-        if self.local_transformer_type != LocalTransformerType.NO_LT:
-            val_local_transformer_loss = collect("val_local_transformer_loss")
-            self.log("val/local_transformer_loss", val_local_transformer_loss, prog_bar=True, sync_dist=True)
-        self.validation_step_outputs.clear()  # free memory
+        """
+        Computes and logs averaged metrics across all validation dataloaders.
+
+        This method:
+        1. Computes per-dataloader metrics from validation outputs.
+        2. Computes averages across all dataloaders.
+        3. Logs both per-dataloader and averaged metrics (e.g., "val_set_0/loss", "val/loss").
+        4. Uses averaged val_loss for checkpointing.
+        """
+        # Check where we don't provide data loaders.
+        if self.validation_step_outputs is None or len(self.validation_step_outputs) == 0:
+            return {}
+
+        # Determine if we have multiple dataloaders
+        is_multi_dataloader = isinstance(self.validation_step_outputs[0], list)
+
+        if is_multi_dataloader:
+            # Multiple dataloaders - compute and log both per-dataloader AND averaged metrics
+
+            all_losses = []
+            all_codebook_losses = []
+            all_alignment_losses = []
+            all_aligner_encoder_losses = []
+            all_local_transformer_losses = []
+
+            # Process each dataloader
+            for dataloader_idx, val_outputs in enumerate(self.validation_step_outputs):
+                if len(val_outputs) == 0:
+                    raise ValueError(
+                        f"Validation dataloader {dataloader_idx} produced no outputs. "
+                        f"This indicates an issue with the dataloader or validation data. "
+                        f"Check that the dataset is not empty and validation_step is working correctly."
+                    )
+
+                # Call multi_validation_epoch_end to get metrics for this dataloader
+                dataloader_logs = self.multi_validation_epoch_end(val_outputs, dataloader_idx=dataloader_idx)
+
+                # Get dataset name prefix
+                dataloader_prefix = self.get_validation_dataloader_prefix(dataloader_idx)
+
+                # Extract metrics from result
+                for metric_name, metric_value in dataloader_logs.items():
+                    # Log per-dataloader metric with prefix
+                    self.log(f"Loss:{dataloader_prefix}/{metric_name}", metric_value, prog_bar=False, sync_dist=True)
+
+                    # Collect for averaging
+                    if metric_name == 'loss':
+                        all_losses.append(metric_value)
+                    elif metric_name == 'codebook_loss':
+                        all_codebook_losses.append(metric_value)
+                    elif metric_name == 'alignment_loss':
+                        all_alignment_losses.append(metric_value)
+                    elif metric_name == 'aligner_encoder_loss':
+                        all_aligner_encoder_losses.append(metric_value)
+                    elif metric_name == 'local_transformer_loss':
+                        all_local_transformer_losses.append(metric_value)
+
+                # Clear outputs for this dataloader
+                self.validation_step_outputs[dataloader_idx].clear()
+
+            # Compute and log averaged metrics
+            if len(all_losses) == 0:
+                raise ValueError("No validation losses collected from any dataloader.")
+            if len(all_codebook_losses) == 0:
+                raise ValueError("No codebook losses collected from any dataloader.")
+
+            avg_val_loss = torch.stack(all_losses).mean()
+            avg_codebook_loss = torch.stack(all_codebook_losses).mean()
+
+            self.log("Loss:val_avg/loss", avg_val_loss, prog_bar=True, sync_dist=True)
+            self.log("Loss:val_avg/codebook_loss", avg_codebook_loss, prog_bar=True, sync_dist=True)
+
+            # Log optional averaged metrics
+            if len(all_alignment_losses) > 0:
+                avg_alignment_loss = torch.stack(all_alignment_losses).mean()
+                self.log("Loss:val_avg/alignment_loss", avg_alignment_loss, prog_bar=True, sync_dist=True)
+
+            if len(all_aligner_encoder_losses) > 0:
+                avg_aligner_encoder_loss = torch.stack(all_aligner_encoder_losses).mean()
+                self.log("Loss:val_avg/aligner_encoder_loss", avg_aligner_encoder_loss, prog_bar=True, sync_dist=True)
+
+            if len(all_local_transformer_losses) > 0:
+                avg_local_transformer_loss = torch.stack(all_local_transformer_losses).mean()
+                self.log(
+                    "Loss:val_avg/local_transformer_loss", avg_local_transformer_loss, prog_bar=True, sync_dist=True
+                )
+
+            # Log avg val_loss for checkpointing (without logger to avoid duplication)
+            self.log(
+                "val_loss",
+                avg_val_loss,
+                prog_bar=False,
+                sync_dist=True,
+                on_step=False,
+                on_epoch=True,
+                logger=False,  # Don't log to wandb (already logged as "Loss:val_avg/loss" above)
+                enable_graph=False,
+            )
+
+            return {}
+
+        else:
+            # Single dataloader - reuse multi_validation_epoch_end logic
+            dataloader_logs = self.multi_validation_epoch_end(self.validation_step_outputs, dataloader_idx=0)
+
+            # Log all metrics with "Loss:val/" prefix
+            for metric_name, metric_value in dataloader_logs.items():
+                self.log(f"Loss:val/{metric_name}", metric_value, prog_bar=True, sync_dist=True)
+
+            # Log val_loss for checkpointing
+            self.log(
+                "val_loss",
+                dataloader_logs['loss'],
+                prog_bar=False,
+                sync_dist=True,
+                on_step=False,
+                on_epoch=True,
+                logger=False,
+                enable_graph=False,
+            )
+
+            self.validation_step_outputs.clear()
+            return {}
 
     def get_dataset(self, dataset_cfg, dataset_type):
         dataset = instantiate(
@@ -3373,6 +3567,115 @@ class MagpieTTSModel(ModelPT):
         )  # This will be used in worker_init_fn for instantiating tokenizer
         return dataset
 
+    def setup_multiple_validation_data(self, val_data_config: Union[DictConfig, Dict]):
+        """
+        Setup validation data with support for multiple datasets.
+        Overrides parent class to handle Lhotse dataloaders with multiple datasets.
+
+        The config structure expected:
+            validation_ds:
+                use_lhotse: true
+                # ... shared settings ...
+                datasets:
+                    - name: "val_set_0"
+                      input_cfg: [...] or path to an external YAML file
+                    - name: "val_set_1"
+                      input_cfg: [...] or path to an external YAML file
+        """
+        # Set placeholders that may be overridden
+        self._val_dl_idx: int = 0
+        self._validation_names: Optional[List[str]] = None
+        self._validation_dl: Optional[torch.utils.data.DataLoader] = None
+
+        # Preserve config
+        self._update_dataset_config(dataset_name='validation', config=val_data_config)
+
+        # Check if datasets is a path to an external YAML file
+        if 'datasets' in val_data_config and isinstance(val_data_config.datasets, (str, Path)):
+            # Load datasets from external YAML file (supports local paths and remote URLs like s3://)
+            datasets_file_path = val_data_config.datasets
+            logging.info(f"Loading validation datasets from external file: {datasets_file_path}")
+            datasets_list = OmegaConf.create(load_yaml(datasets_file_path))
+            # Replace the string path with the loaded list in config
+            with open_dict(val_data_config):
+                val_data_config.datasets = datasets_list
+
+        # Check if we have multiple validation datasets defined
+        has_multiple_datasets = False
+        if 'datasets' in val_data_config:
+            datasets_list = val_data_config.datasets
+            has_multiple_datasets = isinstance(datasets_list, (list, ListConfig)) and len(datasets_list) > 1
+
+        if has_multiple_datasets:
+            # Multiple validation datasets
+            logging.info(f"Setting up {len(val_data_config.datasets)} validation datasets")
+
+            dataloaders = []
+            dataset_names = []
+
+            # Extract shared config (everything except 'datasets' key)
+            shared_config = OmegaConf.create(val_data_config)
+            shared_config.pop('datasets', None)
+
+            for idx, dataset_config in enumerate(val_data_config.datasets):
+                # Merge shared config with dataset-specific config
+                # Dataset-specific config takes precedence
+                merged_config = OmegaConf.merge(shared_config, dataset_config)
+
+                # Get dataset name
+                if isinstance(dataset_config, (dict, DictConfig)) and 'name' in dataset_config:
+                    dataset_name = dataset_config['name']
+                else:
+                    dataset_name = f"val_set_{idx}"
+
+                dataset_names.append(dataset_name)
+
+                # Remove 'name' from config as it's not needed for dataloader setup
+                temp_config = OmegaConf.create(merged_config)
+                temp_config.pop('name', None)
+
+                # Use the existing `_setup_test_dataloader` method
+                # It handles both Lhotse and non-Lhotse cases
+                dataloader = self._setup_test_dataloader(temp_config)
+
+                dataloaders.append(dataloader)
+                logging.info(f"  - Validation dataset {idx}: '{dataset_name}'")
+
+            self._validation_dl = dataloaders
+            self._validation_names = dataset_names
+            logging.info(f"Successfully setup {len(dataloaders)} validation dataloaders")
+
+        else:
+            # Single validation dataset - use the standard setup
+            logging.info("Setting up single validation dataset")
+
+            # If datasets key exists with single entry, extract it
+            if 'datasets' in val_data_config and len(val_data_config.datasets) == 1:
+                # Merge shared config with the single dataset config
+                shared_config = OmegaConf.create(val_data_config)
+                shared_config.pop('datasets', None)
+                single_dataset_config = OmegaConf.merge(shared_config, val_data_config.datasets[0])
+                single_dataset_config.pop('name', None)  # Remove name field
+                self.setup_validation_data(single_dataset_config)
+            elif 'datasets' not in val_data_config:
+                # No datasets key - this is a configuration error
+                raise ValueError(
+                    "Expected 'datasets' key in `validation_ds` config when using `setup_multiple_validation_data`. "
+                    "Please update your config to use the new format:\n"
+                    "validation_ds:\n"
+                    "  # ... shared settings ...\n"
+                    "  datasets:\n"
+                    "    - name: 'val_set_0'\n"
+                    "      input_cfg: [...] or path to an external YAML file\n"
+                    "\nIf you only have one validation dataset, you can still use the 'datasets' list with a single entry."
+                )
+            else:
+                # datasets key exists but is empty or invalid
+                raise ValueError(
+                    f"'datasets' key in `validation_ds` is empty or invalid. "
+                    f"Expected a list with at least one dataset configuration. Got: {val_data_config.datasets}"
+                )
+
     def get_lhotse_dataloader(self, dataset_cfg, mode='train') -> torch.utils.data.DataLoader:
         # TODO @xueyang: better to distinguish cfg. self.cfg is the model cfg, while cfg here is train_ds cfg. Also
         #   cfg is a classifier-free guidance.
@@ -3395,7 +3698,7 @@ class MagpieTTSModel(ModelPT):
             text_context_remapping_prob=self.text_context_remapping_prob,
         )
         data_loader = get_lhotse_dataloader_from_config(
-            config=dataset_cfg.dataset,
+            config=dataset_cfg,
             global_rank=self.global_rank,
             world_size=self.world_size,
             dataset=dataset,
@@ -3410,9 +3713,9 @@ class MagpieTTSModel(ModelPT):
             # specify target sampling rate the same as codec model's because lhotse config defaults 16_000.
             if not isinstance(dataset_cfg, DictConfig):
                 dataset_cfg = OmegaConf.create(dataset_cfg)
-            OmegaConf.set_struct(dataset_cfg.dataset, False)
-            dataset_cfg.dataset.update({"sample_rate": self.sample_rate})
-            OmegaConf.set_struct(dataset_cfg.dataset, True)
+            OmegaConf.set_struct(dataset_cfg, False)
+            dataset_cfg.update({"sample_rate": self.sample_rate})
+            OmegaConf.set_struct(dataset_cfg, True)
 
             self._train_dl = self.get_lhotse_dataloader(dataset_cfg, mode='train')
         else:
@@ -3440,9 +3743,9 @@ class MagpieTTSModel(ModelPT):
             # specify target sampling rate the same as codec model's because lhotse config defaults 16_000.
             if not isinstance(dataset_cfg, DictConfig):
                 dataset_cfg = OmegaConf.create(dataset_cfg)
-            OmegaConf.set_struct(dataset_cfg.dataset, False)
-            dataset_cfg.dataset.update({"sample_rate": self.sample_rate})
-            OmegaConf.set_struct(dataset_cfg.dataset, True)
+            OmegaConf.set_struct(dataset_cfg, False)
+            dataset_cfg.update({"sample_rate": self.sample_rate})
+            OmegaConf.set_struct(dataset_cfg, True)
             data_loader = self.get_lhotse_dataloader(dataset_cfg, mode='test')
         else:
             dataset = self.get_dataset(dataset_cfg, dataset_type='test')
