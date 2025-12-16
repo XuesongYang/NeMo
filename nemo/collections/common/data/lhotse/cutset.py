@@ -50,6 +50,34 @@ from nemo.collections.common.data.lhotse.text_adapters import (
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 
 
+def temperature_reweighting(weights: list[float | int], temperature: float = 1.0):
+    """
+    Apply temperature scaling to dataset weights and normalize.
+
+    Formula: normalized_weight_i = (w_i ^ temperature) / sum(w_j ^ temperature)
+
+    Args:
+        weights: List of dataset weights (can be hours, sample counts, or probabilities).
+                 Values can be any positive float/int, not limited to [0, 1].
+        temperature: Scaling factor.
+                     - 1.0: preserves original weight ratios
+                     - 0.0: equalizes all weights (w^0 = 1)
+                     - <1.0: oversamples smaller datasets
+                     - >1.0: amplifies weight differences
+
+    Returns:
+        Normalized weights that sum to 1.0
+
+    Example:
+        >>> temperature_reweighting([197, 2159], temperature=1.0)  # hours
+        [0.0836, 0.9164]  # preserves ratio
+        >>> temperature_reweighting([197, 2159], temperature=0.0)  # equalize
+        [0.5, 0.5]
+    """
+    weights = np.asarray(weights) ** temperature
+    return (weights / weights.sum()).tolist()
+
+
 def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bool]:
     """
     Reads NeMo configuration and creates a CutSet either from Lhotse or NeMo manifests.
@@ -210,6 +238,8 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
         "force_map_dataset": config.get("force_map_dataset", False),
         "force_iterable_dataset": config.get("force_iterable_dataset", False),
         "slice_length": config.get("slice_length", None),
+        # Temperature for re-weighting datasets. 1 is a neutral value. Lower temperature over-samples smaller datasets, and vice versa.
+        "reweight_temperature": config.get("reweight_temperature", None),
     }
     cuts, is_tarred = parse_and_combine_datasets(config.input_cfg, propagate_attrs=propagate_attrs)
     return cuts, is_tarred
@@ -351,6 +381,14 @@ def parse_and_combine_datasets(
     weights = []
     tarred_status = []
 
+    # Extract the temperature for re-weighting datasets.
+    if not propagate_attrs["reweight_temperature"]:
+        temperature = 1.0
+        next_temperatures = None
+    else:
+        temperature, *next_temperatures = propagate_attrs["reweight_temperature"]
+    propagate_attrs["reweight_temperature"] = next_temperatures
+
     if isinstance(config_list, (str, Path)):
         # Resolve local filepath /path/to/input_cfg.yaml or remote url s3://bucket/path/to/input_cfg.yaml into config contents if needed.
         config_list = OmegaConf.create(load_yaml(config_list))
@@ -394,9 +432,14 @@ def parse_and_combine_datasets(
     ), "Missing dataset weight. When weighting datasets, every dataset must have a specified weight."
 
     if len(cuts) > 1:
+        if not weights:
+            reweights = None
+        else:
+            reweights = temperature_reweighting(weights, temperature=temperature)
+
         cuts = mux(
             *cuts,
-            weights=weights if weights else None,
+            weights=reweights,
             max_open_streams=propagate_attrs["max_open_streams"],
             seed=propagate_attrs["shard_seed"],
             force_finite=propagate_attrs["force_finite"] or propagate_attrs["metadata_only"],

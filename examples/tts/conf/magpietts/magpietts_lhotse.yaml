@@ -87,6 +87,7 @@ model:
       shuffle: true
       num_workers: 6
       pin_memory: true
+      reweight_temperature: [1.0, 0.0]  #  # Temperature for re-weighting datasets. 1 is a neutral value. Lower temperature over-samples smaller datasets, and vice versa. Can be specified multiple times to apply a different temperature to each group level in the YAML config.
 
       input_cfg:
       - type: lhotse_shar
