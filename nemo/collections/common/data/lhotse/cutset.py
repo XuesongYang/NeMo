@@ -50,7 +50,7 @@ from nemo.collections.common.data.lhotse.text_adapters import (
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 
 
-def temperature_reweighting(weights: list[float | int], temperature: float = 1.0):
+def temperature_reweighting(weights: List[Union[float, int]], temperature: float = 1.0) -> List[float]:
     """
     Apply temperature scaling to dataset weights and normalize.
 
