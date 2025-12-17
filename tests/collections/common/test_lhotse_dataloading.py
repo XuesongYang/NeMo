@@ -2725,8 +2725,8 @@ def test_dataloader_reweight_temperature_equalizes_weights(cutset_shar_path: Pat
 
     total = sum(dataset_counts.values())
     # With temperature=0.0, expect approximately equal distribution (50-50)
-    assert pytest.approx(dataset_counts["dataset1"] / total, abs=0.1) == 0.5
-    assert pytest.approx(dataset_counts["dataset2"] / total, abs=0.1) == 0.5
+    assert dataset_counts["dataset1"] / total == pytest.approx(0.5, abs=0.1)
+    assert dataset_counts["dataset2"] / total == pytest.approx(0.5, abs=0.1)
 
 
 def test_dataloader_reweight_temperature_preserves_weights(cutset_shar_path: Path, cutset_shar_path_other: Path):
@@ -2766,8 +2766,8 @@ def test_dataloader_reweight_temperature_preserves_weights(cutset_shar_path: Pat
 
     total = sum(dataset_counts.values())
     # With temperature=1.0, expect approximately 90-10 distribution
-    assert pytest.approx(dataset_counts["dataset1"] / total, abs=0.1) == 0.9
-    assert pytest.approx(dataset_counts["dataset2"] / total, abs=0.1) == 0.1
+    assert dataset_counts["dataset1"] / total == pytest.approx(0.9, abs=0.1)
+    assert dataset_counts["dataset2"] / total == pytest.approx(0.1, abs=0.1)
 
 
 def test_dataloader_reweight_temperature_no_temperature_defaults_to_1(
@@ -2808,8 +2808,8 @@ def test_dataloader_reweight_temperature_no_temperature_defaults_to_1(
 
     total = sum(dataset_counts.values())
     # Without reweight_temperature, expect default behavior (80-20 distribution)
-    assert pytest.approx(dataset_counts["dataset1"] / total, abs=0.1) == 0.8
-    assert pytest.approx(dataset_counts["dataset2"] / total, abs=0.1) == 0.2
+    assert dataset_counts["dataset1"] / total == pytest.approx(0.8, abs=0.1)
+    assert dataset_counts["dataset2"] / total == pytest.approx(0.2, abs=0.1)
 
 
 def test_dataloader_reweight_temperature_intermediate_value(cutset_shar_path: Path, cutset_shar_path_other: Path):
@@ -2852,8 +2852,8 @@ def test_dataloader_reweight_temperature_intermediate_value(cutset_shar_path: Pa
 
     total = sum(dataset_counts.values())
     # With temperature=0.5, expect approximately 75-25 distribution
-    assert pytest.approx(dataset_counts["dataset1"] / total, abs=0.1) == 0.75
-    assert pytest.approx(dataset_counts["dataset2"] / total, abs=0.1) == 0.25
+    assert dataset_counts["dataset1"] / total == pytest.approx(0.75, abs=0.1)
+    assert dataset_counts["dataset2"] / total == pytest.approx(0.25, abs=0.1)
 
 
 def test_dataloader_reweight_temperature_nested_groups(
@@ -2888,13 +2888,13 @@ def test_dataloader_reweight_temperature_nested_groups(
                             "type": "lhotse_shar",
                             "shar_path": cutset_shar_path,
                             "weight": 180,
-                            "tags": {"dataset": "A1"},
+                            "tags": {"dataset_name": "A1"},
                         },
                         {
                             "type": "lhotse_shar",
                             "shar_path": cutset_shar_path_other,
                             "weight": 20,
-                            "tags": {"dataset": "A2"},
+                            "tags": {"dataset_name": "A2"},
                         },
                     ],
                 },
@@ -2908,7 +2908,7 @@ def test_dataloader_reweight_temperature_nested_groups(
                             "manifest_filepath": json_mft,
                             "tarred_audio_filepaths": tar_mft,
                             "weight": 800,
-                            "tags": {"dataset": "B1"},
+                            "tags": {"dataset_name": "B1"},
                         },
                     ],
                 },
@@ -2924,36 +2924,27 @@ def test_dataloader_reweight_temperature_nested_groups(
         }
     )
 
-    dl = get_lhotse_dataloader_from_config(
-        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
-    )
+    dl = get_lhotse_dataloader_from_config(config=config, global_rank=0, world_size=1, dataset=Identity())
 
-    # Sample multiple batches and count occurrences
+    # Sample multiple batches and count occurrences using tags dataset_name
     group_counts = Counter()
     dataset_counts = Counter()
     for batch in islice(dl, 100):
-        for cid in batch["ids"]:
-            if cid.startswith("dummy"):
-                group_counts["A"] += 1
-                dataset_counts["A1"] += 1
-            elif cid.startswith("other"):
-                group_counts["A"] += 1
-                dataset_counts["A2"] += 1
-            else:
-                group_counts["B"] += 1
-                dataset_counts["B1"] += 1
+        for cut in batch:
+            group_counts[cut.group] += 1
+            dataset_counts[cut.dataset_name] += 1
 
     total = sum(group_counts.values())
     # Level 1: temperature=1.0, so groups A and B should have 20-80 split
-    assert pytest.approx(group_counts["A"] / total, abs=0.1) == 0.2
-    assert pytest.approx(group_counts["B"] / total, abs=0.1) == 0.8
+    assert group_counts["A"] / total == pytest.approx(0.2, abs=0.1)
+    assert group_counts["B"] / total == pytest.approx(0.8, abs=0.1)
 
     # Level 2 (within group A): temperature=0.0, so A1 and A2 should be equal (50-50)
     # which means each should be ~10% of total (0.5 * 0.2)
     if group_counts["A"] > 0:  # Make sure we have samples from group A
         a_total = dataset_counts["A1"] + dataset_counts["A2"]
-        assert pytest.approx(dataset_counts["A1"] / a_total, abs=0.15) == 0.5
-        assert pytest.approx(dataset_counts["A2"] / a_total, abs=0.15) == 0.5
+        assert dataset_counts["A1"] / a_total == pytest.approx(0.5, abs=0.15)
+        assert dataset_counts["A2"] / a_total == pytest.approx(0.5, abs=0.15)
 
 
 def test_dataloader_reweight_temperature_three_datasets(
@@ -2994,26 +2985,19 @@ def test_dataloader_reweight_temperature_three_datasets(
         }
     )
 
-    dl = get_lhotse_dataloader_from_config(
-        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
-    )
+    dl = get_lhotse_dataloader_from_config(config=config, global_rank=0, world_size=1, dataset=Identity())
 
-    # Sample multiple batches and count occurrences
+    # Sample multiple batches and count occurrences using the dataset_name tag
     dataset_counts = Counter()
     for batch in islice(dl, 50):
-        for cid in batch["ids"]:
-            if cid.startswith("dummy"):
-                dataset_counts["D1"] += 1
-            elif cid.startswith("other"):
-                dataset_counts["D2"] += 1
-            else:
-                dataset_counts["D3"] += 1
+        for cut in batch:
+            dataset_counts[cut.dataset_name] += 1
 
     total = sum(dataset_counts.values())
     # With temperature=0.0, expect approximately equal distribution (33-33-33)
-    assert pytest.approx(dataset_counts["D1"] / total, abs=0.1) == 1 / 3
-    assert pytest.approx(dataset_counts["D2"] / total, abs=0.1) == 1 / 3
-    assert pytest.approx(dataset_counts["D3"] / total, abs=0.1) == 1 / 3
+    assert dataset_counts["D1"] / total == pytest.approx(1 / 3, abs=0.1)
+    assert dataset_counts["D2"] / total == pytest.approx(1 / 3, abs=0.1)
+    assert dataset_counts["D3"] / total == pytest.approx(1 / 3, abs=0.1)
 
 
 def test_dataloader_reweight_temperature_deeply_nested(
@@ -3042,13 +3026,13 @@ def test_dataloader_reweight_temperature_deeply_nested(
                                     "type": "lhotse_shar",
                                     "shar_path": cutset_shar_path,
                                     "weight": 300,
-                                    "tags": {"dataset": "X1a"},
+                                    "tags": {"dataset_name": "X1a"},
                                 },
                                 {
                                     "type": "lhotse_shar",
                                     "shar_path": cutset_shar_path_other,
                                     "weight": 100,
-                                    "tags": {"dataset": "X1b"},
+                                    "tags": {"dataset_name": "X1b"},
                                 },
                             ],
                         },
@@ -3062,7 +3046,7 @@ def test_dataloader_reweight_temperature_deeply_nested(
                                     "manifest_filepath": json_mft,
                                     "tarred_audio_filepaths": tar_mft,
                                     "weight": 300,
-                                    "tags": {"dataset": "X2a"},
+                                    "tags": {"dataset_name": "X2a"},
                                 },
                             ],
                         },
@@ -3077,7 +3061,7 @@ def test_dataloader_reweight_temperature_deeply_nested(
                             "type": "lhotse_shar",
                             "shar_path": cutset_shar_path,
                             "weight": 300,
-                            "tags": {"dataset": "Y1"},
+                            "tags": {"dataset_name": "Y1"},
                         },
                     ],
                 },

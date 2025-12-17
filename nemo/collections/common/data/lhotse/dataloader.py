@@ -16,7 +16,7 @@ import random
 import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union, List
 
 import numpy as np
 import torch
@@ -103,6 +103,8 @@ class LhotseDataLoadingConfig:
     shard_seed: int | str = "trng"
     max_open_streams: int | None = None
     cuda_expandable_segments: bool = True
+    # Temperature for re-weighting datasets. 1 is a neutral value. Lower temperature over-samples smaller datasets, and vice versa.
+    reweight_temperature: List[float] | None = None
     # e. Multi-config related options.
     #    Setting multi_config=True will scan the config for keys with DictConfig values,
     #    create a separate sampler for each, and fuse the samplers according to sampler_fusion.
