@@ -97,14 +97,20 @@ class TestTemperatureReweighting:
         result = temperature_reweighting([], temperature=1.0)
         assert result == []
 
-    def test_zero_weights_produces_nan(self):
-        """All-zero weights produces nan."""
-        import warnings
+    def test_zero_weights_raises_error(self):
+        """Zero weights raise ValueError."""
+        with pytest.raises(ValueError, match="must be positive"):
+            temperature_reweighting([0, 0, 0], temperature=1.0)
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            result = temperature_reweighting([0, 0, 0], temperature=1.0)
-            assert all(np.isnan(result))
+    def test_negative_weights_raises_error(self):
+        """Negative weights raise ValueError."""
+        with pytest.raises(ValueError, match="must be positive"):
+            temperature_reweighting([100, -50, 200], temperature=1.0)
+
+    def test_mixed_zero_positive_raises_error(self):
+        """Mixed zero and positive weights raise ValueError."""
+        with pytest.raises(ValueError, match="must be positive"):
+            temperature_reweighting([100, 0, 200], temperature=1.0)
 
 
 # =============================================================================

@@ -74,7 +74,12 @@ def temperature_reweighting(weights: List[Union[float, int]], temperature: float
         >>> temperature_reweighting([197, 2159], temperature=0.0)  # equalize
         [0.5, 0.5]
     """
-    weights = np.asarray(weights) ** temperature
+    if len(weights) == 0:
+        return []
+    weights = np.asarray(weights)
+    if np.any(weights <= 0):
+        raise ValueError(f"All weights must be positive (> 0), got: {weights.tolist()}")
+    weights = weights**temperature
     return (weights / weights.sum()).tolist()
 
 
