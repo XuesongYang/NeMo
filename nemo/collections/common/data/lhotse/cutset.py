@@ -20,7 +20,7 @@ import warnings
 from functools import partial
 from itertools import repeat
 from pathlib import Path
-from typing import KeysView, Mapping, Sequence, Tuple, Union
+from typing import KeysView, List, Mapping, Sequence, Tuple, Union
 
 import numpy as np
 import omegaconf
