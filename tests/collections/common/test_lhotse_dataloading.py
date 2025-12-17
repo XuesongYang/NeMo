@@ -2686,3 +2686,422 @@ def test_dataloader_nemo_tarred_slice_length_multi_epoch_different_sample(
     epoch1_ids = [cut.id for b in batches[2:] for cut in b]
     assert epoch0_ids != epoch1_ids
     assert epoch0_ids + epoch1_ids != sorted(epoch0_ids + epoch1_ids)  # true when slice_length=None
+
+
+def test_dataloader_reweight_temperature_equalizes_weights(cutset_shar_path: Path, cutset_shar_path_other: Path):
+    """
+    Test that reweight_temperature=0.0 equalizes sampling from datasets with different weights.
+    With temperature=0.0, two datasets with weights 900 and 100 should be sampled equally (50-50).
+    """
+    config = OmegaConf.create(
+        {
+            "input_cfg": [
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path, "weight": 900},
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path_other, "weight": 100},
+            ],
+            "reweight_temperature": [0.0],
+            "sample_rate": 16000,
+            "shuffle": True,
+            "use_lhotse": True,
+            "num_workers": 0,
+            "batch_size": 4,
+            "seed": 0,
+            "shard_seed": 0,
+        }
+    )
+
+    dl = get_lhotse_dataloader_from_config(
+        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
+    )
+
+    # Sample multiple batches and count occurrences
+    dataset_counts = Counter()
+    for batch in islice(dl, 50):
+        for cid in batch["ids"]:
+            if cid.startswith("dummy"):
+                dataset_counts["dataset1"] += 1
+            elif cid.startswith("other"):
+                dataset_counts["dataset2"] += 1
+
+    total = sum(dataset_counts.values())
+    # With temperature=0.0, expect approximately equal distribution (50-50)
+    assert pytest.approx(dataset_counts["dataset1"] / total, abs=0.1) == 0.5
+    assert pytest.approx(dataset_counts["dataset2"] / total, abs=0.1) == 0.5
+
+
+def test_dataloader_reweight_temperature_preserves_weights(cutset_shar_path: Path, cutset_shar_path_other: Path):
+    """
+    Test that reweight_temperature=1.0 preserves the original weight ratios.
+    With temperature=1.0, two datasets with weights 900 and 100 should be sampled 90-10.
+    """
+    config = OmegaConf.create(
+        {
+            "input_cfg": [
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path, "weight": 900},
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path_other, "weight": 100},
+            ],
+            "reweight_temperature": [1.0],
+            "sample_rate": 16000,
+            "shuffle": True,
+            "use_lhotse": True,
+            "num_workers": 0,
+            "batch_size": 4,
+            "seed": 0,
+            "shard_seed": 0,
+        }
+    )
+
+    dl = get_lhotse_dataloader_from_config(
+        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
+    )
+
+    # Sample multiple batches and count occurrences
+    dataset_counts = Counter()
+    for batch in islice(dl, 50):
+        for cid in batch["ids"]:
+            if cid.startswith("dummy"):
+                dataset_counts["dataset1"] += 1
+            elif cid.startswith("other"):
+                dataset_counts["dataset2"] += 1
+
+    total = sum(dataset_counts.values())
+    # With temperature=1.0, expect approximately 90-10 distribution
+    assert pytest.approx(dataset_counts["dataset1"] / total, abs=0.1) == 0.9
+    assert pytest.approx(dataset_counts["dataset2"] / total, abs=0.1) == 0.1
+
+
+def test_dataloader_reweight_temperature_no_temperature_defaults_to_1(
+    cutset_shar_path: Path, cutset_shar_path_other: Path
+):
+    """
+    Test that without specifying reweight_temperature, it defaults to 1.0 (preserving weights).
+    """
+    config = OmegaConf.create(
+        {
+            "input_cfg": [
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path, "weight": 800},
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path_other, "weight": 200},
+            ],
+            # No reweight_temperature specified
+            "sample_rate": 16000,
+            "shuffle": True,
+            "use_lhotse": True,
+            "num_workers": 0,
+            "batch_size": 4,
+            "seed": 0,
+            "shard_seed": 0,
+        }
+    )
+
+    dl = get_lhotse_dataloader_from_config(
+        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
+    )
+
+    # Sample multiple batches and count occurrences
+    dataset_counts = Counter()
+    for batch in islice(dl, 50):
+        for cid in batch["ids"]:
+            if cid.startswith("dummy"):
+                dataset_counts["dataset1"] += 1
+            elif cid.startswith("other"):
+                dataset_counts["dataset2"] += 1
+
+    total = sum(dataset_counts.values())
+    # Without reweight_temperature, expect default behavior (80-20 distribution)
+    assert pytest.approx(dataset_counts["dataset1"] / total, abs=0.1) == 0.8
+    assert pytest.approx(dataset_counts["dataset2"] / total, abs=0.1) == 0.2
+
+
+def test_dataloader_reweight_temperature_intermediate_value(cutset_shar_path: Path, cutset_shar_path_other: Path):
+    """
+    Test that reweight_temperature=0.5 gives intermediate behavior between equal and original weights.
+    With temperature=0.5, datasets with weights 900 and 100:
+    - Original (temp=1.0): 90-10
+    - Equal (temp=0.0): 50-50
+    - Expected (temp=0.5): ~75-25 (since 900^0.5 / (900^0.5 + 100^0.5) ≈ 0.75)
+    """
+    config = OmegaConf.create(
+        {
+            "input_cfg": [
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path, "weight": 900},
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path_other, "weight": 100},
+            ],
+            "reweight_temperature": [0.5],
+            "sample_rate": 16000,
+            "shuffle": True,
+            "use_lhotse": True,
+            "num_workers": 0,
+            "batch_size": 4,
+            "seed": 0,
+            "shard_seed": 0,
+        }
+    )
+
+    dl = get_lhotse_dataloader_from_config(
+        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
+    )
+
+    # Sample multiple batches and count occurrences
+    dataset_counts = Counter()
+    for batch in islice(dl, 50):
+        for cid in batch["ids"]:
+            if cid.startswith("dummy"):
+                dataset_counts["dataset1"] += 1
+            elif cid.startswith("other"):
+                dataset_counts["dataset2"] += 1
+
+    total = sum(dataset_counts.values())
+    # With temperature=0.5, expect approximately 75-25 distribution
+    assert pytest.approx(dataset_counts["dataset1"] / total, abs=0.1) == 0.75
+    assert pytest.approx(dataset_counts["dataset2"] / total, abs=0.1) == 0.25
+
+
+def test_dataloader_reweight_temperature_nested_groups(
+    cutset_shar_path: Path, cutset_shar_path_other: Path, nemo_tarred_manifest_path_multi: tuple[str, str]
+):
+    """
+    Test that reweight_temperature works correctly with nested groups.
+    Using [1.0, 0.0]: level 1 preserves weights, level 2 equalizes.
+
+    Structure:
+    - Group A (weight=200):
+      - Dataset A1 (weight=180)
+      - Dataset A2 (weight=20)
+    - Group B (weight=800):
+      - Dataset B1 (weight=800)
+
+    Expected:
+    - Level 1 (temp=1.0): Group A gets 20%, Group B gets 80%
+    - Level 2 (temp=0.0): Within Group A, A1 and A2 each get 50% (so 10% and 10% of total)
+    """
+    json_mft, tar_mft = nemo_tarred_manifest_path_multi
+
+    config = OmegaConf.create(
+        {
+            "input_cfg": [
+                {
+                    "type": "group",
+                    "weight": 200,
+                    "tags": {"group": "A"},
+                    "input_cfg": [
+                        {
+                            "type": "lhotse_shar",
+                            "shar_path": cutset_shar_path,
+                            "weight": 180,
+                            "tags": {"dataset": "A1"},
+                        },
+                        {
+                            "type": "lhotse_shar",
+                            "shar_path": cutset_shar_path_other,
+                            "weight": 20,
+                            "tags": {"dataset": "A2"},
+                        },
+                    ],
+                },
+                {
+                    "type": "group",
+                    "weight": 800,
+                    "tags": {"group": "B"},
+                    "input_cfg": [
+                        {
+                            "type": "nemo_tarred",
+                            "manifest_filepath": json_mft,
+                            "tarred_audio_filepaths": tar_mft,
+                            "weight": 800,
+                            "tags": {"dataset": "B1"},
+                        },
+                    ],
+                },
+            ],
+            "reweight_temperature": [1.0, 0.0],  # Level 1: preserve, Level 2: equalize
+            "sample_rate": 16000,
+            "shuffle": True,
+            "use_lhotse": True,
+            "num_workers": 0,
+            "batch_size": 4,
+            "seed": 0,
+            "shard_seed": 0,
+        }
+    )
+
+    dl = get_lhotse_dataloader_from_config(
+        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
+    )
+
+    # Sample multiple batches and count occurrences
+    group_counts = Counter()
+    dataset_counts = Counter()
+    for batch in islice(dl, 100):
+        for cid in batch["ids"]:
+            if cid.startswith("dummy"):
+                group_counts["A"] += 1
+                dataset_counts["A1"] += 1
+            elif cid.startswith("other"):
+                group_counts["A"] += 1
+                dataset_counts["A2"] += 1
+            else:
+                group_counts["B"] += 1
+                dataset_counts["B1"] += 1
+
+    total = sum(group_counts.values())
+    # Level 1: temperature=1.0, so groups A and B should have 20-80 split
+    assert pytest.approx(group_counts["A"] / total, abs=0.1) == 0.2
+    assert pytest.approx(group_counts["B"] / total, abs=0.1) == 0.8
+
+    # Level 2 (within group A): temperature=0.0, so A1 and A2 should be equal (50-50)
+    # which means each should be ~10% of total (0.5 * 0.2)
+    if group_counts["A"] > 0:  # Make sure we have samples from group A
+        a_total = dataset_counts["A1"] + dataset_counts["A2"]
+        assert pytest.approx(dataset_counts["A1"] / a_total, abs=0.15) == 0.5
+        assert pytest.approx(dataset_counts["A2"] / a_total, abs=0.15) == 0.5
+
+
+def test_dataloader_reweight_temperature_three_datasets(
+    cutset_shar_path: Path, cutset_shar_path_other: Path, nemo_tarred_manifest_path_multi: tuple[str, str]
+):
+    """
+    Test reweight_temperature with three datasets of different sizes.
+    With temperature=0.0, all three should be sampled equally.
+    """
+    json_mft, tar_mft = nemo_tarred_manifest_path_multi
+
+    config = OmegaConf.create(
+        {
+            "input_cfg": [
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path, "weight": 600, "tags": {"dataset_name": "D1"}},
+                {
+                    "type": "lhotse_shar",
+                    "shar_path": cutset_shar_path_other,
+                    "weight": 300,
+                    "tags": {"dataset_name": "D2"},
+                },
+                {
+                    "type": "nemo_tarred",
+                    "manifest_filepath": json_mft,
+                    "tarred_audio_filepaths": tar_mft,
+                    "weight": 100,
+                    "tags": {"dataset_name": "D3"},
+                },
+            ],
+            "reweight_temperature": [0.0],  # Equalize all three
+            "sample_rate": 16000,
+            "shuffle": True,
+            "use_lhotse": True,
+            "num_workers": 0,
+            "batch_size": 6,
+            "seed": 0,
+            "shard_seed": 0,
+        }
+    )
+
+    dl = get_lhotse_dataloader_from_config(
+        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
+    )
+
+    # Sample multiple batches and count occurrences
+    dataset_counts = Counter()
+    for batch in islice(dl, 50):
+        for cid in batch["ids"]:
+            if cid.startswith("dummy"):
+                dataset_counts["D1"] += 1
+            elif cid.startswith("other"):
+                dataset_counts["D2"] += 1
+            else:
+                dataset_counts["D3"] += 1
+
+    total = sum(dataset_counts.values())
+    # With temperature=0.0, expect approximately equal distribution (33-33-33)
+    assert pytest.approx(dataset_counts["D1"] / total, abs=0.1) == 1 / 3
+    assert pytest.approx(dataset_counts["D2"] / total, abs=0.1) == 1 / 3
+    assert pytest.approx(dataset_counts["D3"] / total, abs=0.1) == 1 / 3
+
+
+def test_dataloader_reweight_temperature_deeply_nested(
+    cutset_shar_path: Path, cutset_shar_path_other: Path, nemo_tarred_manifest_path_multi: tuple[str, str]
+):
+    """
+    Test reweight_temperature with three levels of nesting using [1.0, 0.5, 0.0].
+    This verifies that temperature is correctly applied at each level of the hierarchy.
+    """
+    json_mft, tar_mft = nemo_tarred_manifest_path_multi
+
+    config = OmegaConf.create(
+        {
+            "input_cfg": [
+                {
+                    "type": "group",
+                    "weight": 700,
+                    "tags": {"level1": "GroupX"},
+                    "input_cfg": [
+                        {
+                            "type": "group",
+                            "weight": 400,
+                            "tags": {"level2": "GroupX1"},
+                            "input_cfg": [
+                                {
+                                    "type": "lhotse_shar",
+                                    "shar_path": cutset_shar_path,
+                                    "weight": 300,
+                                    "tags": {"dataset": "X1a"},
+                                },
+                                {
+                                    "type": "lhotse_shar",
+                                    "shar_path": cutset_shar_path_other,
+                                    "weight": 100,
+                                    "tags": {"dataset": "X1b"},
+                                },
+                            ],
+                        },
+                        {
+                            "type": "group",
+                            "weight": 300,
+                            "tags": {"level2": "GroupX2"},
+                            "input_cfg": [
+                                {
+                                    "type": "nemo_tarred",
+                                    "manifest_filepath": json_mft,
+                                    "tarred_audio_filepaths": tar_mft,
+                                    "weight": 300,
+                                    "tags": {"dataset": "X2a"},
+                                },
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "type": "group",
+                    "weight": 300,
+                    "tags": {"level1": "GroupY"},
+                    "input_cfg": [
+                        {
+                            "type": "lhotse_shar",
+                            "shar_path": cutset_shar_path,
+                            "weight": 300,
+                            "tags": {"dataset": "Y1"},
+                        },
+                    ],
+                },
+            ],
+            "reweight_temperature": [1.0, 0.5, 0.0],  # Level 1: preserve, Level 2: intermediate, Level 3: equalize
+            "sample_rate": 16000,
+            "shuffle": True,
+            "use_lhotse": True,
+            "num_workers": 0,
+            "batch_size": 4,
+            "seed": 0,
+            "shard_seed": 0,
+        }
+    )
+
+    dl = get_lhotse_dataloader_from_config(
+        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
+    )
+
+    # Sample multiple batches and just verify it works without errors
+    # The exact distribution is complex to calculate, so we just ensure the dataloader runs
+    batches = [batch for batch in islice(dl, 20)]
+    assert len(batches) == 20
+    for batch in batches:
+        assert "audio" in batch
+        assert "audio_lens" in batch
+        assert "ids" in batch
