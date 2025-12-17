@@ -18,6 +18,7 @@ Integration tests mock data loading and verify that weights passed to mux() are 
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 from lhotse import CutSet
 from omegaconf import OmegaConf
 
