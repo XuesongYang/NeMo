@@ -281,3 +281,267 @@ class TestMuxWeights:
         # Level 1 group: temp=1.0 -> preserved
         expected_level1 = [197 / 2356, 2159 / 2356]
         np.testing.assert_allclose(captured_mux_calls[1]["weights"], expected_level1, rtol=1e-7)
+
+
+# =============================================================================
+# Tests for count_input_cfg_levels function
+# =============================================================================
+
+from nemo.collections.common.data.lhotse.cutset import count_input_cfg_levels
+
+
+class TestCountInputCfgLevels:
+    """Tests for the count_input_cfg_levels function that computes max nesting depth."""
+
+    def test_single_level_flat_structure(self):
+        """Single level with no nested groups returns 1."""
+        config = {
+            "input_cfg": [
+                {"type": "lhotse_shar", "shar_path": "/path1"},
+                {"type": "nemo_tarred", "manifest_filepath": "/path2"},
+            ]
+        }
+        assert count_input_cfg_levels(config) == 1
+
+    def test_two_levels_single_group(self):
+        """Two levels with one nested group returns 2."""
+        config = {
+            "input_cfg": [
+                {
+                    "type": "group",
+                    "input_cfg": [
+                        {"type": "lhotse_shar", "shar_path": "/path1"},
+                    ],
+                },
+            ]
+        }
+        assert count_input_cfg_levels(config) == 2
+
+    def test_two_levels_sibling_groups(self):
+        """Two sibling groups at the same level should return 2, not 3."""
+        config = {
+            "input_cfg": [
+                {
+                    "type": "group",
+                    "input_cfg": [
+                        {"type": "lhotse_shar", "shar_path": "/path1"},
+                    ],
+                },
+                {
+                    "type": "group",
+                    "input_cfg": [
+                        {"type": "lhotse_shar", "shar_path": "/path2"},
+                    ],
+                },
+            ]
+        }
+        # This is the key test - siblings share the same temperature level
+        assert count_input_cfg_levels(config) == 2
+
+    def test_three_levels_deep_nesting(self):
+        """Three levels of deep nesting returns 3."""
+        config = {
+            "input_cfg": [
+                {
+                    "type": "group",
+                    "input_cfg": [
+                        {
+                            "type": "group",
+                            "input_cfg": [
+                                {"type": "lhotse_shar", "shar_path": "/path1"},
+                            ],
+                        },
+                    ],
+                },
+            ]
+        }
+        assert count_input_cfg_levels(config) == 3
+
+    def test_mixed_depths_returns_max(self):
+        """Mixed depths should return the maximum depth."""
+        config = {
+            "input_cfg": [
+                {
+                    "type": "group",
+                    "input_cfg": [
+                        {
+                            "type": "group",
+                            "input_cfg": [
+                                {"type": "lhotse_shar", "shar_path": "/path1"},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "type": "group",
+                    "input_cfg": [
+                        {"type": "lhotse_shar", "shar_path": "/path2"},
+                    ],
+                },
+                {"type": "lhotse_shar", "shar_path": "/path3"},
+            ]
+        }
+        # Max depth is 3 (first branch goes deepest)
+        assert count_input_cfg_levels(config) == 3
+
+    def test_no_input_cfg_returns_zero(self):
+        """Config without input_cfg returns 0."""
+        config = {"manifest_filepath": "/path/to/manifest.json"}
+        assert count_input_cfg_levels(config) == 0
+
+    def test_empty_input_cfg_returns_one(self):
+        """Empty input_cfg list still counts as 1 level."""
+        config = {"input_cfg": []}
+        assert count_input_cfg_levels(config) == 1
+
+    def test_with_omegaconf_dictconfig(self):
+        """Works with OmegaConf DictConfig."""
+        config = OmegaConf.create(
+            {
+                "input_cfg": [
+                    {
+                        "type": "group",
+                        "input_cfg": [
+                            {"type": "lhotse_shar", "shar_path": "/path1"},
+                        ],
+                    },
+                    {
+                        "type": "group",
+                        "input_cfg": [
+                            {"type": "lhotse_shar", "shar_path": "/path2"},
+                        ],
+                    },
+                ]
+            }
+        )
+        assert count_input_cfg_levels(config) == 2
+
+
+class TestReweightTemperatureValidation:
+    """Tests for standardization of reweight_temperature to match nesting depth."""
+
+    def test_scalar_temperature_broadcasts_to_all_levels(self):
+        """Scalar temperature is broadcast to all levels with warning."""
+        config = OmegaConf.create(
+            {
+                "input_cfg": [
+                    {
+                        "type": "group",
+                        "weight": 100,
+                        "input_cfg": [
+                            {"type": "lhotse_shar", "shar_path": "/fake/path1", "weight": 50},
+                            {"type": "lhotse_shar", "shar_path": "/fake/path2", "weight": 50},
+                        ],
+                    },
+                ],
+                "reweight_temperature": 0.5,  # Scalar for 2 levels
+                "shuffle": True,
+                "shard_seed": 42,
+            }
+        )
+
+        def mock_mux(*cuts, weights=None, **kwargs):
+            return MagicMock(spec=CutSet)
+
+        with patch("nemo.collections.common.data.lhotse.cutset.mux", side_effect=mock_mux):
+            with patch("nemo.collections.common.data.lhotse.cutset.get_parser_fn", return_value=make_mock_parser_fn()):
+                with patch("nemo.collections.common.data.lhotse.cutset.logging") as mock_logging:
+                    cuts, is_tarred = read_cutset_from_config(config)
+                    assert cuts is not None
+                    # Verify warning was logged
+                    mock_logging.warning.assert_called_once()
+                    warning_msg = mock_logging.warning.call_args[0][0]
+                    assert "scalar" in warning_msg.lower()
+                    assert "broadcasting" in warning_msg.lower()
+
+    def test_temperature_list_too_long_trims_with_warning(self):
+        """Too many temperatures are trimmed with warning."""
+        config = OmegaConf.create(
+            {
+                "input_cfg": [
+                    {"type": "lhotse_shar", "shar_path": "/fake/path1", "weight": 100},
+                ],
+                "reweight_temperature": [1.0, 0.5, 0.0],  # 3 temperatures for 1 level
+                "shuffle": True,
+                "shard_seed": 42,
+            }
+        )
+
+        def mock_mux(*cuts, weights=None, **kwargs):
+            return MagicMock(spec=CutSet)
+
+        with patch("nemo.collections.common.data.lhotse.cutset.mux", side_effect=mock_mux):
+            with patch("nemo.collections.common.data.lhotse.cutset.get_parser_fn", return_value=make_mock_parser_fn()):
+                with patch("nemo.collections.common.data.lhotse.cutset.logging") as mock_logging:
+                    cuts, is_tarred = read_cutset_from_config(config)
+                    assert cuts is not None
+                    # Verify warning was logged
+                    mock_logging.warning.assert_called_once()
+                    warning_msg = mock_logging.warning.call_args[0][0]
+                    assert "longer" in warning_msg.lower()
+                    assert "trimming" in warning_msg.lower()
+
+    def test_temperature_list_too_short_extends_with_warning(self):
+        """Too few temperatures are extended by repeating last value with warning."""
+        config = OmegaConf.create(
+            {
+                "input_cfg": [
+                    {
+                        "type": "group",
+                        "weight": 100,
+                        "input_cfg": [
+                            {"type": "lhotse_shar", "shar_path": "/fake/path1", "weight": 50},
+                            {"type": "lhotse_shar", "shar_path": "/fake/path2", "weight": 50},
+                        ],
+                    },
+                ],
+                "reweight_temperature": [1.0],  # Only 1 temperature for 2 levels
+                "shuffle": True,
+                "shard_seed": 42,
+            }
+        )
+
+        def mock_mux(*cuts, weights=None, **kwargs):
+            return MagicMock(spec=CutSet)
+
+        with patch("nemo.collections.common.data.lhotse.cutset.mux", side_effect=mock_mux):
+            with patch("nemo.collections.common.data.lhotse.cutset.get_parser_fn", return_value=make_mock_parser_fn()):
+                with patch("nemo.collections.common.data.lhotse.cutset.logging") as mock_logging:
+                    cuts, is_tarred = read_cutset_from_config(config)
+                    assert cuts is not None
+                    # Verify warning was logged
+                    mock_logging.warning.assert_called_once()
+                    warning_msg = mock_logging.warning.call_args[0][0]
+                    assert "shorter" in warning_msg.lower()
+                    assert "extending" in warning_msg.lower()
+
+    def test_correct_temperature_list_length_no_warning(self):
+        """Correct temperature list length works without warning."""
+        config = OmegaConf.create(
+            {
+                "input_cfg": [
+                    {
+                        "type": "group",
+                        "weight": 100,
+                        "input_cfg": [
+                            {"type": "lhotse_shar", "shar_path": "/fake/path1", "weight": 50},
+                            {"type": "lhotse_shar", "shar_path": "/fake/path2", "weight": 50},
+                        ],
+                    },
+                ],
+                "reweight_temperature": [1.0, 0.5],  # 2 temperatures for 2 levels - correct!
+                "shuffle": True,
+                "shard_seed": 42,
+            }
+        )
+
+        def mock_mux(*cuts, weights=None, **kwargs):
+            return MagicMock(spec=CutSet)
+
+        with patch("nemo.collections.common.data.lhotse.cutset.mux", side_effect=mock_mux):
+            with patch("nemo.collections.common.data.lhotse.cutset.get_parser_fn", return_value=make_mock_parser_fn()):
+                with patch("nemo.collections.common.data.lhotse.cutset.logging") as mock_logging:
+                    cuts, is_tarred = read_cutset_from_config(config)
+                    assert cuts is not None
+                    # Verify NO warning was logged
+                    mock_logging.warning.assert_not_called()
