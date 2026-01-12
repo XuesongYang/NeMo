@@ -16,7 +16,7 @@ import random
 import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional, Sequence, Union, List
+from typing import Any, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -104,7 +104,9 @@ class LhotseDataLoadingConfig:
     max_open_streams: int | None = None
     cuda_expandable_segments: bool = True
     # Temperature for re-weighting datasets. 1 is a neutral value. Lower temperature over-samples smaller datasets, and vice versa.
-    reweight_temperature: List[float] | None = None
+    # Can be a scalar (applied to all levels) or a list (one per nesting level).
+    # If list length doesn't match nesting depth, it will be extended or trimmed with a warning.
+    reweight_temperature: Any = None  # float | int | list[float] | None = None
     # e. Multi-config related options.
     #    Setting multi_config=True will scan the config for keys with DictConfig values,
     #    create a separate sampler for each, and fuse the samplers according to sampler_fusion.

@@ -3089,3 +3089,153 @@ def test_dataloader_reweight_temperature_deeply_nested(
         assert "audio" in batch
         assert "audio_lens" in batch
         assert "ids" in batch
+
+
+def test_dataloader_reweight_temperature_mixed_leaf_and_group(cutset_shar_path: Path, cutset_shar_path_other: Path):
+    """
+    Test config with mix of leaf items and groups at the same level.
+    The leaf item doesn't have nested input_cfg, but the group does.
+    Max depth should be 2, requiring 2 temperatures.
+    """
+    config = OmegaConf.create(
+        {
+            "input_cfg": [
+                # Leaf item at level 1 (no nested input_cfg)
+                {
+                    "type": "lhotse_shar",
+                    "shar_path": cutset_shar_path,
+                    "weight": 300,
+                    "tags": {"dataset_name": "Leaf"},
+                },
+                # Group with nested items
+                {
+                    "type": "group",
+                    "weight": 700,
+                    "tags": {"group": "Nested"},
+                    "input_cfg": [
+                        {
+                            "type": "lhotse_shar",
+                            "shar_path": cutset_shar_path_other,
+                            "weight": 600,
+                            "tags": {"dataset_name": "N1"},
+                        },
+                        {
+                            "type": "lhotse_shar",
+                            "shar_path": cutset_shar_path,
+                            "weight": 100,
+                            "tags": {"dataset_name": "N2"},
+                        },
+                    ],
+                },
+            ],
+            "reweight_temperature": [1.0, 0.0],  # 2 levels: level 1 preserves, level 2 equalizes
+            "sample_rate": 16000,
+            "shuffle": True,
+            "use_lhotse": True,
+            "num_workers": 0,
+            "batch_size": 4,
+            "seed": 0,
+            "shard_seed": 0,
+        }
+    )
+
+    dl = get_lhotse_dataloader_from_config(config=config, global_rank=0, world_size=1, dataset=Identity())
+
+    # Sample multiple batches and count occurrences
+    dataset_counts = Counter()
+    for batch in islice(dl, 100):
+        for cut in batch:
+            dataset_counts[cut.dataset_name] += 1
+
+    total = sum(dataset_counts.values())
+
+    # Level 1: Leaf gets 30%, Nested group gets 70% (temperature=1.0 preserves weights)
+    assert dataset_counts["Leaf"] / total == pytest.approx(0.3, abs=0.1)
+
+    # Level 2 within Nested group: N1 and N2 should be equalized (temperature=0.0)
+    # Each should get ~35% of total (0.7 * 0.5)
+    nested_total = dataset_counts["N1"] + dataset_counts["N2"]
+    assert dataset_counts["N1"] / nested_total == pytest.approx(0.5, abs=0.15)
+    assert dataset_counts["N2"] / nested_total == pytest.approx(0.5, abs=0.15)
+
+
+def test_dataloader_reweight_temperature_scalar_broadcasts(cutset_shar_path: Path, cutset_shar_path_other: Path):
+    """
+    Test that scalar reweight_temperature broadcasts to all levels.
+    With temperature=0.0 (scalar), datasets with different weights should be sampled equally.
+    """
+    config = OmegaConf.create(
+        {
+            "input_cfg": [
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path, "weight": 900},
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path_other, "weight": 100},
+            ],
+            "reweight_temperature": 0.0,  # Scalar - should broadcast to all levels
+            "sample_rate": 16000,
+            "shuffle": True,
+            "use_lhotse": True,
+            "num_workers": 0,
+            "batch_size": 4,
+            "seed": 0,
+            "shard_seed": 0,
+        }
+    )
+
+    dl = get_lhotse_dataloader_from_config(
+        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
+    )
+
+    # Sample multiple batches and count occurrences
+    dataset_counts = Counter()
+    for batch in islice(dl, 50):
+        for cid in batch["ids"]:
+            if cid.startswith("dummy"):
+                dataset_counts["dataset1"] += 1
+            elif cid.startswith("other"):
+                dataset_counts["dataset2"] += 1
+
+    total = sum(dataset_counts.values())
+    # With temperature=0.0, expect approximately equal distribution (50-50)
+    assert dataset_counts["dataset1"] / total == pytest.approx(0.5, abs=0.1)
+    assert dataset_counts["dataset2"] / total == pytest.approx(0.5, abs=0.1)
+
+
+def test_dataloader_reweight_temperature_list_too_long_trims(cutset_shar_path: Path, cutset_shar_path_other: Path):
+    """
+    Test that providing too many temperatures trims the list (with warning).
+    The dataloader should still work correctly using only the needed temperatures.
+    """
+    config = OmegaConf.create(
+        {
+            "input_cfg": [
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path, "weight": 900},
+                {"type": "lhotse_shar", "shar_path": cutset_shar_path_other, "weight": 100},
+            ],
+            "reweight_temperature": [0.0, 0.5, 1.0],  # 3 temperatures for 1 level - will be trimmed to [0.0]
+            "sample_rate": 16000,
+            "shuffle": True,
+            "use_lhotse": True,
+            "num_workers": 0,
+            "batch_size": 4,
+            "seed": 0,
+            "shard_seed": 0,
+        }
+    )
+
+    dl = get_lhotse_dataloader_from_config(
+        config=config, global_rank=0, world_size=1, dataset=UnsupervisedAudioDataset()
+    )
+
+    # Sample multiple batches and count occurrences
+    dataset_counts = Counter()
+    for batch in islice(dl, 50):
+        for cid in batch["ids"]:
+            if cid.startswith("dummy"):
+                dataset_counts["dataset1"] += 1
+            elif cid.startswith("other"):
+                dataset_counts["dataset2"] += 1
+
+    total = sum(dataset_counts.values())
+    # With temperature=0.0 (first value after trimming), expect approximately equal distribution (50-50)
+    assert dataset_counts["dataset1"] / total == pytest.approx(0.5, abs=0.1)
+    assert dataset_counts["dataset2"] / total == pytest.approx(0.5, abs=0.1)

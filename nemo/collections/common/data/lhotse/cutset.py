@@ -246,6 +246,48 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
         # Temperature for re-weighting datasets. 1 is a neutral value. Lower temperature over-samples smaller datasets, and vice versa.
         "reweight_temperature": config.get("reweight_temperature", None),
     }
+
+    # Standardize reweight_temperature to match the nesting depth
+    if propagate_attrs["reweight_temperature"] is not None:
+        expected_length = count_input_cfg_levels(config)
+        reweight_temp = propagate_attrs["reweight_temperature"]
+
+        # Case 1: Scalar value - broadcast to all levels
+        if isinstance(reweight_temp, (int, float)):
+            propagate_attrs["reweight_temperature"] = [float(reweight_temp)] * expected_length
+            logging.warning(
+                f"reweight_temperature is a scalar ({reweight_temp}), broadcasting to all {expected_length} levels. "
+                f"Expanded to: {propagate_attrs['reweight_temperature']}"
+            )
+        else:
+            # Case 2:Convert to list if needed (e.g., from ListConfig)
+            reweight_temp = list(reweight_temp)
+            actual_length = len(reweight_temp)
+
+            if actual_length == expected_length:
+                # Case 2.1: Exact match - no modification needed
+                propagate_attrs["reweight_temperature"] = reweight_temp
+            elif actual_length < expected_length:
+                # Case 2.2: Too short - extend by repeating last value
+                last_value = reweight_temp[-1] if reweight_temp else 1.0
+                extended = reweight_temp + [last_value] * (expected_length - actual_length)
+                propagate_attrs["reweight_temperature"] = extended
+                logging.warning(
+                    f"reweight_temperature list is shorter than nesting depth: "
+                    f"got {actual_length} values for {expected_length} levels. "
+                    f"Extending by repeating last value ({last_value}). "
+                    f"Expanded to: {extended}"
+                )
+            else:
+                # Case 2.3: Too long - trim to max depth
+                trimmed = reweight_temp[:expected_length]
+                propagate_attrs["reweight_temperature"] = trimmed
+                logging.warning(
+                    f"reweight_temperature list is longer than nesting depth: "
+                    f"got {actual_length} values for {expected_length} levels. "
+                    f"Trimming extra values. Using: {trimmed}"
+                )
+
     cuts, is_tarred = parse_and_combine_datasets(config.input_cfg, propagate_attrs=propagate_attrs)
     return cuts, is_tarred
 
@@ -375,6 +417,50 @@ def attach_tags(cut, tags: dict):
     for key, val in tags.items():
         setattr(cut, key, val)
     return cut
+
+
+def count_input_cfg_levels(config: Union[DictConfig, dict]) -> int:
+    """
+    Compute the maximum nesting depth of 'input_cfg' keys in the configuration.
+
+    Each 'input_cfg' represents one level of nesting that consumes one temperature
+    value from reweight_temperature. Since sibling groups at the same level share
+    the same temperature (due to propagate_attrs.copy()), we count max depth,
+    not total occurrences.
+
+    Args:
+        config: Configuration dictionary that may contain nested 'input_cfg' keys.
+
+    Returns:
+        Maximum nesting depth of 'input_cfg' keys.
+
+    Example:
+        >>> config = {
+        ...     "input_cfg": [
+        ...         {"type": "group", "input_cfg": [{"type": "nemo"}]},
+        ...         {"type": "group", "input_cfg": [{"type": "nemo"}]},
+        ...     ]
+        ... }
+        >>> count_input_cfg_levels(config)
+        2
+    """
+
+    def _max_depth(obj) -> int:
+        if isinstance(obj, (dict, DictConfig)):
+            depths = []
+            for key, val in obj.items():
+                if key == "input_cfg":
+                    # Found input_cfg: this level counts as 1 + max depth of children
+                    depths.append(1 + _max_depth(val))
+                else:
+                    depths.append(_max_depth(val))
+            return max(depths, default=0)
+        elif isinstance(obj, (list, ListConfig)):
+            # For lists, find the max depth across all items (siblings)
+            return max((_max_depth(item) for item in obj), default=0)
+        return 0
+
+    return _max_depth(config)
 
 
 @data_type_parser("group")
