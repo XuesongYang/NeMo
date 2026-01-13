@@ -260,7 +260,7 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
                 f"Expanded to: {propagate_attrs['reweight_temperature']}"
             )
         else:
-            # Case 2:Convert to list if needed (e.g., from ListConfig)
+            # Case 2: Convert to list if needed (e.g., from ListConfig)
             reweight_temp = list(reweight_temp)
             actual_length = len(reweight_temp)
 
