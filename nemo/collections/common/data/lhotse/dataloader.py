@@ -16,7 +16,7 @@ import random
 import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, List, Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 import numpy as np
 import torch
