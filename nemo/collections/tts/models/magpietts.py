@@ -1713,128 +1713,200 @@ class MagpieTTSModel(ModelPT):
         all_preds = torch.stack(all_preds, dim=2)  # (B, num_codebooks, frame_stacking_factor)
         return all_preds
 
-    def log_attention_probs(self, attention_prob_matrix, audio_codes_lens, text_lens, prefix="", dec_context_size=0):
-        # attention_prob_matrix List of (B, C, audio_timesteps, text_timesteps)
-        wandb_images_log = {}
+    def _prepare_attention_images(
+        self,
+        attention_prob_matrix: List[torch.Tensor],
+        audio_codes_lens: torch.Tensor,
+        text_lens: torch.Tensor,
+        dec_context_size: int = 0,
+        max_examples: int = 3,
+    ) -> List[np.ndarray]:
+        """
+        Convert attention probability matrices to numpy images for logging.
 
+        Args:
+            attention_prob_matrix: List of attention tensors, each (B, H, audio_timesteps, text_timesteps).
+            audio_codes_lens: Audio sequence lengths per example.
+            text_lens: Text sequence lengths per example.
+            dec_context_size: Number of context audio frames to skip in attention visualization.
+            max_examples: Maximum number of examples to generate images for.
+
+        Returns:
+            List of numpy arrays in HWC format, one per example.
+        """
         with torch.no_grad():
+            # Concatenate attention heads and average
             attention_prob_matrix = torch.cat(attention_prob_matrix, dim=1)  # (B, C, audio_timesteps, text_timesteps)
             attention_prob_matrix_mean = attention_prob_matrix.mean(dim=1)  # (B, audio_timesteps, text_timesteps)
 
-            for logger in self.loggers:
-                is_wandb = isinstance(logger, WandbLogger)
-                is_tb = isinstance(logger, TensorBoardLogger)
-                if not is_wandb and not is_tb:
-                    raise ValueError(
-                        f"Invalid logger type for image logging: {type(logger)}. Only `WandbLogger` and `TensorBoardLogger` are supported."
-                    )
+            images = []
+            num_examples = min(max_examples, attention_prob_matrix_mean.size(0))
+            for idx in range(num_examples):
+                # Slice attention matrix to valid region (excluding context frames)
+                audio_len = int(audio_codes_lens[idx])
+                text_len = int(text_lens[idx])
+                item_attn_matrix = attention_prob_matrix_mean[idx][
+                    dec_context_size : dec_context_size + audio_len, :text_len
+                ]
+                item_attn_matrix = item_attn_matrix.detach().cpu().numpy()
+                img_np = plot_alignment_to_numpy(item_attn_matrix.T)
+                images.append(img_np)
 
-                wandb_images_log[f"Image:{prefix}/attention_matrix"] = list()
-                for idx in range(min(3, attention_prob_matrix_mean.size(0))):
-                    item_attn_matrix = attention_prob_matrix_mean[idx][
-                        dec_context_size : dec_context_size + audio_codes_lens[idx], : text_lens[idx]
-                    ]
-                    item_attn_matrix = item_attn_matrix.detach().cpu().numpy()
-                    img_np = plot_alignment_to_numpy(item_attn_matrix.T)
+            return images
 
-                    if is_wandb:
-                        wandb_images_log[f"Image:{prefix}/attention_matrix"].append(
-                            wandb.Image(img_np, caption=f"Example_{idx}")
-                        )
-
-                    if is_tb:
-                        logger.experiment.add_image(
-                            f'{prefix}/attention_matrix/Example_{idx}',
-                            img_np,
-                            global_step=self.global_step,
-                            dataformats="HWC",
-                        )
-
-        return wandb_images_log
-
-    def log_val_audio_example(
+    def _prepare_audio_examples(
         self,
-        logits,
-        target_audio_codes,
-        audio_codes_lens,
-        context_audio_codes=None,
-        context_audio_codes_lens=None,
-        prefix="val",
-    ):
-        wandb_audio_log = {}
+        logits: torch.Tensor,
+        target_audio_codes: torch.Tensor,
+        audio_codes_lens_target: torch.Tensor,
+        context_audio_codes: Optional[torch.Tensor] = None,
+        context_audio_codes_lens: Optional[torch.Tensor] = None,
+        max_examples: int = 3,
+    ) -> Dict[str, List[Optional[np.ndarray]]]:
+        """
+        Decode audio codes to waveforms and convert to numpy arrays for logging.
 
-        pred_audio_codes = self.logits_to_audio_codes(logits, audio_codes_lens)
-        pred_audio_codes, audio_codes_lens_pred = self.remove_eos_token(
-            codes=pred_audio_codes, codes_len=audio_codes_lens
-        )
-        pred_audio, pred_audio_lens, _ = self.codes_to_audio(pred_audio_codes, audio_codes_lens_pred)
+        Args:
+            logits: Model output logits to convert to predicted audio.
+            target_audio_codes: Ground truth audio codes.
+            audio_codes_lens_target: Lengths of target audio codes.
+            context_audio_codes: Optional context audio codes for voice cloning.
+            context_audio_codes_lens: Lengths of context audio codes.
+            max_examples: Maximum number of examples to process.
 
-        target_audio_codes, audio_codes_lens_target = self.remove_eos_token(
-            codes=target_audio_codes, codes_len=audio_codes_lens
-        )
-        target_audio, target_audio_lens, _ = self.codes_to_audio(target_audio_codes, audio_codes_lens_target)
+        Returns:
+            Dict with keys 'pred_audios', 'target_audios', 'context_audios',
+            each containing a list of numpy arrays (or None for context if unavailable).
+        """
+        with torch.no_grad():
+            # Decode predictions and targets
+            pred_audio_codes = self.logits_to_audio_codes(logits, audio_codes_lens_target)
+            pred_audio, pred_audio_lens = self.codes_to_audio(pred_audio_codes, audio_codes_lens_target)
+            target_audio, target_audio_lens = self.codes_to_audio(target_audio_codes, audio_codes_lens_target)
 
-        context_audio, context_audio_lens = None, None
-        if context_audio_codes is not None and context_audio_codes.shape[2] > 3:
-            context_audio_codes, context_audio_codes_lens = self.remove_special_tokens(
-                codes=context_audio_codes, codes_len=context_audio_codes_lens
-            )
-            # > 3 ensures, it is a valid context audio tensor (and not dummy tensor used in text context)
-            context_audio, context_audio_lens, _ = self.codes_to_audio(context_audio_codes, context_audio_codes_lens)
+            # Decode context audio if available (shape check ensures it's not a dummy tensor used in text context)
+            context_audio, context_audio_lens = None, None
+            if context_audio_codes is not None and context_audio_codes.shape[2] > 3:
+                context_audio, context_audio_lens = self.codes_to_audio(context_audio_codes, context_audio_codes_lens)
+
+            pred_audios = []
+            target_audios = []
+            context_audios = []
+
+            num_examples = min(max_examples, pred_audio.size(0))
+            for idx in range(num_examples):
+                # Convert to numpy and trim to actual length
+                pred_audio_np = pred_audio[idx, : pred_audio_lens[idx]].float().cpu().numpy()
+                target_audio_np = target_audio[idx, : target_audio_lens[idx]].float().cpu().numpy()
+
+                pred_audios.append(pred_audio_np)
+                target_audios.append(target_audio_np)
+
+                if context_audio is not None:
+                    context_audio_np = context_audio[idx, : context_audio_lens[idx]].float().cpu().numpy()
+                    context_audios.append(context_audio_np)
+                else:
+                    context_audios.append(None)
+
+            return {
+                'pred_audios': pred_audios,
+                'target_audios': target_audios,
+                'context_audios': context_audios,
+            }
+
+    def _log_media_to_wandb_and_tb(self, media_data: Dict, global_step: int) -> None:
+        """
+        Log audio examples and attention images to WandB and/or TensorBoard.
+
+        This method creates wandb.Audio/wandb.Image objects and logs them.
+        It batches all WandB logs into a single call for efficiency.
+
+        Args:
+            media_data: Dict containing:
+                - 'dataset_prefix': str, prefix for log keys (e.g., 'val', 'val_set_0')
+                - 'audio_data': Dict with 'pred_audios', 'target_audios', 'context_audios' lists
+                - 'attention_data': Dict mapping attention names to lists of numpy images
+            global_step: Current training step for logging.
+        """
+        dataset_prefix = media_data.get('dataset_prefix', 'val')
+        audio_data = media_data.get('audio_data', {})
+        attention_data = media_data.get('attention_data', {})
 
         for logger in self.loggers:
             is_wandb = isinstance(logger, WandbLogger)
             is_tb = isinstance(logger, TensorBoardLogger)
             if not is_wandb and not is_tb:
                 raise ValueError(
-                    f"Invalid logger type for audio logging: {type(logger)}. Only `WandbLogger` and `TensorBoardLogger` are supported."
+                    f"Unsupported logger type: {type(logger)}. "
+                    f"Only WandbLogger and TensorBoardLogger are supported for media logging."
                 )
 
-            for idx in range(min(3, pred_audio.size(0))):
-                pred_audio_np = pred_audio[idx].float().detach().cpu().numpy()
-                target_audio_np = target_audio[idx].float().detach().cpu().numpy()
-                pred_audio_np = pred_audio_np[: pred_audio_lens[idx]]
-                target_audio_np = target_audio_np[: target_audio_lens[idx]]
-                context_audio_np = None
-                if context_audio is not None:
-                    context_audio_np = context_audio[idx].float().detach().cpu().numpy()
-                    context_audio_np = context_audio_np[: context_audio_lens[idx]]
+            wandb_log_dict = {}
 
+            # Log audio examples
+            pred_audios = audio_data.get('pred_audios', [])
+            target_audios = audio_data.get('target_audios', [])
+            context_audios = audio_data.get('context_audios', [])
+
+            for idx, (pred_audio_np, target_audio_np, context_audio_np) in enumerate(
+                zip(pred_audios, target_audios, context_audios)
+            ):
                 if is_wandb:
-                    wandb_audio_log[f"Audio:{prefix}/Example_{idx}"] = list()
+                    audio_list = []
                     if context_audio_np is not None:
-                        wandb_audio_log[f"Audio:{prefix}/Example_{idx}"].append(
-                            wandb.Audio(context_audio_np, sample_rate=self.sample_rate, caption="context")
+                        audio_list.append(
+                            wandb.Audio(context_audio_np, sample_rate=self.output_sample_rate, caption="context")
                         )
-                    wandb_audio_log[f"Audio:{prefix}/Example_{idx}"].append(
-                        wandb.Audio(pred_audio_np, sample_rate=self.sample_rate, caption="prediction")
-                    )
-                    wandb_audio_log[f"Audio:{prefix}/Example_{idx}"].append(
-                        wandb.Audio(target_audio_np, sample_rate=self.sample_rate, caption="target")
-                    )
+                    audio_list.append(wandb.Audio(pred_audio_np, sample_rate=self.output_sample_rate, caption="prediction"))
+                    audio_list.append(wandb.Audio(target_audio_np, sample_rate=self.output_sample_rate, caption="target"))
+                    wandb_log_dict[f"Audio:{dataset_prefix}/Example_{idx}"] = audio_list
 
                 if is_tb:
                     if context_audio_np is not None:
                         logger.experiment.add_audio(
-                            f'{prefix}/Example_{idx}/context',
+                            f'{dataset_prefix}/Example_{idx}/context',
                             context_audio_np,
-                            global_step=self.global_step,
+                            global_step=global_step,
                             sample_rate=self.output_sample_rate,
                         )
                     logger.experiment.add_audio(
-                        f'{prefix}/Example_{idx}/prediction',
+                        f'{dataset_prefix}/Example_{idx}/prediction',
                         pred_audio_np,
-                        global_step=self.global_step,
+                        global_step=global_step,
                         sample_rate=self.output_sample_rate,
                     )
                     logger.experiment.add_audio(
-                        f'{prefix}/Example_{idx}/target',
+                        f'{dataset_prefix}/Example_{idx}/target',
                         target_audio_np,
-                        global_step=self.global_step,
+                        global_step=global_step,
                         sample_rate=self.output_sample_rate,
                     )
 
-        return wandb_audio_log
+            # Log attention images
+            for attn_key, images in attention_data.items():
+                # Determine log prefix: 'overall' uses dataset_prefix directly, others are nested
+                if attn_key == 'overall':
+                    prefix = dataset_prefix
+                else:
+                    prefix = f"{dataset_prefix}/{attn_key}"
+
+                if is_wandb:
+                    wandb_log_dict[f"Image:{prefix}/attention_matrix"] = [
+                        wandb.Image(img_np, caption=f"Example_{idx}") for idx, img_np in enumerate(images)
+                    ]
+
+                if is_tb:
+                    for idx, img_np in enumerate(images):
+                        logger.experiment.add_image(
+                            f'{prefix}/attention_matrix/Example_{idx}',
+                            img_np,
+                            global_step=global_step,
+                            dataformats="HWC",
+                        )
+
+            # Perform single wandb log call
+            if is_wandb and wandb_log_dict:
+                logger.experiment.log(wandb_log_dict)
 
     def scale_prior(self, prior, global_step):
         if prior is None:
@@ -2648,85 +2720,6 @@ class MagpieTTSModel(ModelPT):
         text_lens = batch_output['text_lens']
         dec_context_size = batch_output['dec_context_size']
 
-        # Log audio and attention on first batch of all dataloaders
-        if batch_idx == 0 and self.global_rank == 0:
-            # Get dataset name for logging prefix
-            dataset_prefix = "val"
-            if self._validation_names is not None:  # indicates multi-dataloader
-                dataset_prefix = self._validation_names[dataloader_idx]
-
-            # Prepare dictionary for aggregated wandb logging
-            wandb_log_dict = {}
-
-            # Log audio examples with dataset-specific prefix
-            wandb_log_dict.update(
-                self.log_val_audio_example(
-                    logits,
-                    audio_codes_target,
-                    audio_codes_lens_target,
-                    context_audio_codes,
-                    context_audio_codes_lens,
-                    prefix=dataset_prefix,
-                )
-            )
-
-            # Log attention if available
-            if len(attn_info[self.transcript_decoder_layers[0]]['cross_attn_probabilities']) > 1:
-                # cross_attn_probabilities only returned when not using flash attention
-                cross_attention_probs = [
-                    attn['cross_attn_probabilities'][0]
-                    for layer_idx, attn in enumerate(attn_info)
-                    if layer_idx in self.ctc_prior_layer_ids
-                ]
-                wandb_log_dict.update(
-                    self.log_attention_probs(
-                        cross_attention_probs,
-                        audio_codes_lens_target,
-                        text_lens,
-                        prefix=dataset_prefix,
-                        dec_context_size=dec_context_size,
-                    )
-                )
-
-                # Log per-layer attention
-                for layer_idx in self.transcript_decoder_layers:
-                    cross_attention_probs = [attn_info[layer_idx]['cross_attn_probabilities'][0]]
-                    wandb_log_dict.update(
-                        self.log_attention_probs(
-                            cross_attention_probs,
-                            audio_codes_lens_target,
-                            text_lens,
-                            prefix=f"{dataset_prefix}/layer_{layer_idx}",
-                            dec_context_size=dec_context_size,
-                        )
-                    )
-
-                # Log aligner attention if available
-                if batch_output['aligner_attn_soft'] is not None:
-                    wandb_log_dict.update(
-                        self.log_attention_probs(
-                            [batch_output['aligner_attn_soft']],
-                            audio_codes_lens_target,
-                            text_lens,
-                            prefix=f"{dataset_prefix}/aligner_encoder_attn",
-                        )
-                    )
-
-                if batch_output['aligner_attn_hard'] is not None:
-                    wandb_log_dict.update(
-                        self.log_attention_probs(
-                            [batch_output['aligner_attn_hard'].unsqueeze(1)],
-                            audio_codes_lens_target,
-                            text_lens,
-                            prefix=f"{dataset_prefix}/aligner_encoder_attn_hard",
-                        )
-                    )
-
-            # Perform single wandb log call if wandb is active and there is data
-            for logger in self.loggers:
-                if isinstance(logger, WandbLogger) and wandb_log_dict:
-                    logger.experiment.log(wandb_log_dict)
-
         val_output = {
             'val_loss': loss,
             'val_codebook_loss': codebook_loss,
@@ -2739,6 +2732,81 @@ class MagpieTTSModel(ModelPT):
             val_output['val_local_transformer_loss'] = local_transformer_loss
         if aligner_encoder_loss is not None:
             val_output['val_aligner_encoder_loss'] = aligner_encoder_loss
+
+        # Prepare media data for logging (only first batch of each dataloader, rank 0 only).
+        if batch_idx == 0 and self.global_rank == 0:
+            # Determine dataset name for logging prefix
+            dataset_prefix = "val"
+            if self._validation_names is not None:  # multi-dataloader case
+                dataset_prefix = self._validation_names[dataloader_idx]
+
+            # Prepare audio examples (decode via vocoder, convert to numpy)
+            audio_data = self._prepare_audio_examples(
+                logits=logits,
+                target_audio_codes=audio_codes_target,
+                audio_codes_lens_target=audio_codes_lens_target,
+                context_audio_codes=context_audio_codes,
+                context_audio_codes_lens=context_audio_codes_lens,
+                max_examples=3,
+            )
+
+            # Prepare attention images (only when cross-attention is available)
+            attention_data = {}
+            has_cross_attn = (
+                self.model_type != 'decoder_pretrain_synthesizer'
+                and len(attn_info[self.transcript_decoder_layers[0]].get('cross_attn_probabilities', [])) > 1
+            )
+
+            if has_cross_attn:
+                # Overall attention: average across CTC prior layers
+                cross_attention_probs = [
+                    attn['cross_attn_probabilities'][0]
+                    for layer_idx, attn in enumerate(attn_info)
+                    if layer_idx in self.ctc_prior_layer_ids
+                ]
+                attention_data['overall'] = self._prepare_attention_images(
+                    cross_attention_probs,
+                    audio_codes_lens_target,
+                    text_lens,
+                    dec_context_size=dec_context_size,
+                    max_examples=3,
+                )
+
+                # Per-layer attention visualization
+                for layer_idx in self.transcript_decoder_layers:
+                    layer_cross_attention_probs = [attn_info[layer_idx]['cross_attn_probabilities'][0]]
+                    attention_data[f'layer_{layer_idx}'] = self._prepare_attention_images(
+                        layer_cross_attention_probs,
+                        audio_codes_lens_target,
+                        text_lens,
+                        dec_context_size=dec_context_size,
+                        max_examples=3,
+                    )
+
+                # Aligner encoder attention (if available)
+                if batch_output['aligner_attn_soft'] is not None:
+                    attention_data['aligner_encoder_attn'] = self._prepare_attention_images(
+                        [batch_output['aligner_attn_soft']],
+                        audio_codes_lens_target,
+                        text_lens,
+                        dec_context_size=0,
+                        max_examples=3,
+                    )
+
+                if batch_output['aligner_attn_hard'] is not None:
+                    attention_data['aligner_encoder_attn_hard'] = self._prepare_attention_images(
+                        [batch_output['aligner_attn_hard'].unsqueeze(1)],
+                        audio_codes_lens_target,
+                        text_lens,
+                        dec_context_size=0,
+                        max_examples=3,
+                    )
+
+            val_output['media_data'] = {
+                'dataset_prefix': dataset_prefix,
+                'audio_data': audio_data,
+                'attention_data': attention_data,
+            }
 
         # Append to appropriate list based on structure
         # validation_step_outputs is initialized in ModelPT: [] for single dataloader, [[], [], ...] for multiple dataloaders.
@@ -3433,6 +3501,18 @@ class MagpieTTSModel(ModelPT):
 
         # Determine if we have multiple dataloaders
         is_multi_dataloader = isinstance(self.validation_step_outputs[0], list)
+
+        # Log media (audio + attention images) from first batch of each dataloader.
+        # Media data was prepared in validation_step; here we just create wandb/tb objects and log.
+        if self.global_rank == 0:
+            global_step = int(self.global_step)
+            if is_multi_dataloader:
+                for val_outputs in self.validation_step_outputs:
+                    if len(val_outputs) > 0 and 'media_data' in val_outputs[0]:
+                        self._log_media_to_wandb_and_tb(val_outputs[0]['media_data'], global_step)
+            else:
+                if len(self.validation_step_outputs) > 0 and 'media_data' in self.validation_step_outputs[0]:
+                    self._log_media_to_wandb_and_tb(self.validation_step_outputs[0]['media_data'], global_step)
 
         if is_multi_dataloader:
             # Multiple dataloaders - compute and log both per-dataloader AND averaged metrics
