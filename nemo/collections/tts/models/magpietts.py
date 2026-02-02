@@ -18,8 +18,8 @@ import random
 import time
 from dataclasses import dataclass, field, fields
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import soundfile as sf
@@ -1758,7 +1758,7 @@ class MagpieTTSModel(ModelPT):
         self,
         logits: torch.Tensor,
         target_audio_codes: torch.Tensor,
-        audio_codes_lens_target: torch.Tensor,
+        audio_codes_lens: torch.Tensor,
         context_audio_codes: Optional[torch.Tensor] = None,
         context_audio_codes_lens: Optional[torch.Tensor] = None,
         max_examples: int = 3,
@@ -1769,7 +1769,7 @@ class MagpieTTSModel(ModelPT):
         Args:
             logits: Model output logits to convert to predicted audio.
             target_audio_codes: Ground truth audio codes.
-            audio_codes_lens_target: Lengths of target audio codes.
+            audio_codes_lens: Lengths of target audio codes.
             context_audio_codes: Optional context audio codes for voice cloning.
             context_audio_codes_lens: Lengths of context audio codes.
             max_examples: Maximum number of examples to process.
@@ -1779,15 +1779,28 @@ class MagpieTTSModel(ModelPT):
             each containing a list of numpy arrays (or None for context if unavailable).
         """
         with torch.no_grad():
-            # Decode predictions and targets
-            pred_audio_codes = self.logits_to_audio_codes(logits, audio_codes_lens_target)
-            pred_audio, pred_audio_lens = self.codes_to_audio(pred_audio_codes, audio_codes_lens_target)
-            target_audio, target_audio_lens = self.codes_to_audio(target_audio_codes, audio_codes_lens_target)
+            # Decode predictions: convert logits to codes, remove EOS token, then decode to audio
+            pred_audio_codes = self.logits_to_audio_codes(logits, audio_codes_lens)
+            pred_audio_codes, pred_audio_codes_lens = self.remove_eos_token(
+                codes=pred_audio_codes, codes_len=audio_codes_lens
+            )
+            pred_audio, pred_audio_lens, _ = self.codes_to_audio(pred_audio_codes, pred_audio_codes_lens)
+
+            # Decode targets: remove EOS token, then decode to audio
+            target_audio_codes, target_audio_codes_lens = self.remove_eos_token(
+                codes=target_audio_codes, codes_len=audio_codes_lens
+            )
+            target_audio, target_audio_lens, _ = self.codes_to_audio(target_audio_codes, target_audio_codes_lens)
 
             # Decode context audio if available (shape check ensures it's not a dummy tensor used in text context)
             context_audio, context_audio_lens = None, None
             if context_audio_codes is not None and context_audio_codes.shape[2] > 3:
-                context_audio, context_audio_lens = self.codes_to_audio(context_audio_codes, context_audio_codes_lens)
+                context_audio_codes, context_audio_codes_lens = self.remove_special_tokens(
+                    codes=context_audio_codes, codes_len=context_audio_codes_lens
+                )
+                context_audio, context_audio_lens, _ = self.codes_to_audio(
+                    context_audio_codes, context_audio_codes_lens
+                )
 
             pred_audios = []
             target_audios = []
@@ -1857,8 +1870,12 @@ class MagpieTTSModel(ModelPT):
                         audio_list.append(
                             wandb.Audio(context_audio_np, sample_rate=self.output_sample_rate, caption="context")
                         )
-                    audio_list.append(wandb.Audio(pred_audio_np, sample_rate=self.output_sample_rate, caption="prediction"))
-                    audio_list.append(wandb.Audio(target_audio_np, sample_rate=self.output_sample_rate, caption="target"))
+                    audio_list.append(
+                        wandb.Audio(pred_audio_np, sample_rate=self.output_sample_rate, caption="prediction")
+                    )
+                    audio_list.append(
+                        wandb.Audio(target_audio_np, sample_rate=self.output_sample_rate, caption="target")
+                    )
                     wandb_log_dict[f"Audio:{dataset_prefix}/Example_{idx}"] = audio_list
 
                 if is_tb:
@@ -2702,7 +2719,7 @@ class MagpieTTSModel(ModelPT):
             batch_idx: Batch index
             dataloader_idx: Index of the dataloader (0 for single dataloader)
         """
-        batch_output = self.process_batch(batch, mode="val")
+        batch_output = self.process_batch(batch)
         # self.process_batch returns a dict. We currently only log "logits" which come from the parallel prediction
         # head. If we use local_transformer, then the local_transformer returns "local_transformer_logits"
 
@@ -2744,7 +2761,7 @@ class MagpieTTSModel(ModelPT):
             audio_data = self._prepare_audio_examples(
                 logits=logits,
                 target_audio_codes=audio_codes_target,
-                audio_codes_lens_target=audio_codes_lens_target,
+                audio_codes_lens=audio_codes_lens_target,
                 context_audio_codes=context_audio_codes,
                 context_audio_codes_lens=context_audio_codes_lens,
                 max_examples=3,
