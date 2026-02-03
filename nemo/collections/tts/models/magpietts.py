@@ -3758,17 +3758,10 @@ class MagpieTTSModel(ModelPT):
                 single_dataset_config.pop('name', None)  # Remove name field
                 self.setup_validation_data(single_dataset_config)
             elif 'datasets' not in val_data_config:
-                # No datasets key - this is a configuration error
-                raise ValueError(
-                    "Expected 'datasets' key in `validation_ds` config when using `setup_multiple_validation_data`. "
-                    "Please update your config to use the new format:\n"
-                    "validation_ds:\n"
-                    "  # ... shared settings ...\n"
-                    "  datasets:\n"
-                    "    - name: 'val_set_0'\n"
-                    "      input_cfg: [...] or path to an external YAML file\n"
-                    "\nIf you only have one validation dataset, you can still use the 'datasets' list with a single entry."
-                )
+                # No datasets key - use legacy single-dataset format (backward compatibility)
+                # This handles non-lhotse configs with validation_ds.dataset structure
+                logging.info("Using legacy validation config format (no 'datasets' key)")
+                self.setup_validation_data(val_data_config)
             else:
                 # datasets key exists but is empty or invalid
                 raise ValueError(
