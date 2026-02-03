@@ -291,6 +291,29 @@ class ModelInferenceParameters:
         return cls(**filtered_data)
 
 
+@dataclass
+class ValidationMediaData:
+    """Data container for media logging during validation.
+
+    This dataclass groups all the data needed for logging audio examples and
+    attention images to WandB and TensorBoard during validation.
+
+    Attributes:
+        dataset_prefix: Prefix for log keys (e.g., 'val', 'val_set_0').
+        pred_audios: List of predicted audio waveforms as numpy arrays.
+        target_audios: List of target audio waveforms as numpy arrays.
+        context_audios: List of context audio waveforms (or None if unavailable).
+        attention_data: Dict mapping attention names to lists of numpy images.
+            Keys like 'overall', 'layer_0', 'aligner_encoder_attn' map to image lists.
+    """
+
+    dataset_prefix: str
+    pred_audios: List[np.ndarray]
+    target_audios: List[np.ndarray]
+    context_audios: List[Optional[np.ndarray]]
+    attention_data: Dict[str, List[np.ndarray]]
+
+
 def worker_init_fn(worker_id):
     # For mp.set_start_method("spawn", force=True)
     # The dataset class should be picklable, so we initialize non-picklable objects here
@@ -1827,7 +1850,7 @@ class MagpieTTSModel(ModelPT):
                 'context_audios': context_audios,
             }
 
-    def _log_media_to_wandb_and_tb(self, media_data: Dict, global_step: int) -> None:
+    def _log_media_to_wandb_and_tb(self, media_data: ValidationMediaData, global_step: int) -> None:
         """
         Log audio examples and attention images to WandB and/or TensorBoard.
 
@@ -1835,16 +1858,9 @@ class MagpieTTSModel(ModelPT):
         It batches all WandB logs into a single call for efficiency.
 
         Args:
-            media_data: Dict containing:
-                - 'dataset_prefix': str, prefix for log keys (e.g., 'val', 'val_set_0')
-                - 'audio_data': Dict with 'pred_audios', 'target_audios', 'context_audios' lists
-                - 'attention_data': Dict mapping attention names to lists of numpy images
+            media_data: ValidationMediaData containing audio waveforms and attention images.
             global_step: Current training step for logging.
         """
-        dataset_prefix = media_data.get('dataset_prefix', 'val')
-        audio_data = media_data.get('audio_data', {})
-        attention_data = media_data.get('attention_data', {})
-
         for logger in self.loggers:
             is_wandb = isinstance(logger, WandbLogger)
             is_tb = isinstance(logger, TensorBoardLogger)
@@ -1857,12 +1873,8 @@ class MagpieTTSModel(ModelPT):
             wandb_log_dict = {}
 
             # Log audio examples
-            pred_audios = audio_data.get('pred_audios', [])
-            target_audios = audio_data.get('target_audios', [])
-            context_audios = audio_data.get('context_audios', [])
-
             for idx, (pred_audio_np, target_audio_np, context_audio_np) in enumerate(
-                zip(pred_audios, target_audios, context_audios)
+                zip(media_data.pred_audios, media_data.target_audios, media_data.context_audios)
             ):
                 if is_wandb:
                     audio_list = []
@@ -1876,36 +1888,36 @@ class MagpieTTSModel(ModelPT):
                     audio_list.append(
                         wandb.Audio(target_audio_np, sample_rate=self.output_sample_rate, caption="target")
                     )
-                    wandb_log_dict[f"Audio:{dataset_prefix}/Example_{idx}"] = audio_list
+                    wandb_log_dict[f"Audio:{media_data.dataset_prefix}/Example_{idx}"] = audio_list
 
                 if is_tb:
                     if context_audio_np is not None:
                         logger.experiment.add_audio(
-                            f'{dataset_prefix}/Example_{idx}/context',
+                            f'{media_data.dataset_prefix}/Example_{idx}/context',
                             context_audio_np,
                             global_step=global_step,
                             sample_rate=self.output_sample_rate,
                         )
                     logger.experiment.add_audio(
-                        f'{dataset_prefix}/Example_{idx}/prediction',
+                        f'{media_data.dataset_prefix}/Example_{idx}/prediction',
                         pred_audio_np,
                         global_step=global_step,
                         sample_rate=self.output_sample_rate,
                     )
                     logger.experiment.add_audio(
-                        f'{dataset_prefix}/Example_{idx}/target',
+                        f'{media_data.dataset_prefix}/Example_{idx}/target',
                         target_audio_np,
                         global_step=global_step,
                         sample_rate=self.output_sample_rate,
                     )
 
             # Log attention images
-            for attn_key, images in attention_data.items():
+            for attn_key, images in media_data.attention_data.items():
                 # Determine log prefix: 'overall' uses dataset_prefix directly, others are nested
                 if attn_key == 'overall':
-                    prefix = dataset_prefix
+                    prefix = media_data.dataset_prefix
                 else:
-                    prefix = f"{dataset_prefix}/{attn_key}"
+                    prefix = f"{media_data.dataset_prefix}/{attn_key}"
 
                 if is_wandb:
                     wandb_log_dict[f"Image:{prefix}/attention_matrix"] = [
@@ -2819,11 +2831,14 @@ class MagpieTTSModel(ModelPT):
                         max_examples=3,
                     )
 
-            val_output['media_data'] = {
-                'dataset_prefix': dataset_prefix,
-                'audio_data': audio_data,
-                'attention_data': attention_data,
-            }
+            # Store media data as a typed dataclass for cleaner API
+            val_output['media_data'] = ValidationMediaData(
+                dataset_prefix=dataset_prefix,
+                pred_audios=audio_data['pred_audios'],
+                target_audios=audio_data['target_audios'],
+                context_audios=audio_data['context_audios'],
+                attention_data=attention_data,
+            )
 
         # Append to appropriate list based on structure
         # validation_step_outputs is initialized in ModelPT: [] for single dataloader, [[], [], ...] for multiple dataloaders.
