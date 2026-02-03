@@ -16,6 +16,7 @@ import json
 import os
 import random
 import time
+import warnings
 from dataclasses import dataclass, field, fields
 from functools import partial
 from pathlib import Path
@@ -3775,6 +3776,17 @@ class MagpieTTSModel(ModelPT):
             elif 'datasets' not in val_data_config:
                 # No datasets key - use legacy single-dataset format (backward compatibility)
                 # This handles non-lhotse configs with validation_ds.dataset structure
+                warnings.warn(
+                    "The legacy validation config format (without 'datasets' key) is deprecated "
+                    "and will be removed in a future release. Please migrate to the new format:\n"
+                    "  validation_ds:\n"
+                    "    datasets:\n"
+                    "      - name: 'val_set_0'\n"
+                    "        input_cfg: [...]\n"
+                    "See the magpietts_lhotse.yaml config for examples.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
                 logging.info("Using legacy validation config format (no 'datasets' key)")
                 self.setup_validation_data(val_data_config)
             else:
