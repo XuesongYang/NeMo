@@ -3509,8 +3509,11 @@ class MagpieTTSModel(ModelPT):
         This method:
         1. Computes per-dataloader metrics from validation outputs.
         2. Computes averages across all dataloaders.
-        3. Logs both per-dataloader and averaged metrics (e.g., "val_set_0/loss", "val/loss").
-        4. Uses averaged val_loss for checkpointing.
+        3. Logs both per-dataloader and averaged metrics:
+           - Per-dataloader: "Loss:<dataset_name>/loss", "Loss:<dataset_name>/codebook_loss", etc.
+           - Averaged (multi-dataloader): "Loss:val_avg/loss", "Loss:val_avg/codebook_loss", etc.
+           - Single dataloader: "Loss:val/loss", "Loss:val/codebook_loss", etc.
+        4. Uses averaged val_loss for checkpointing (logged without logger prefix for ModelCheckpoint).
         """
         # Check where we don't provide data loaders.
         if self.validation_step_outputs is None or len(self.validation_step_outputs) == 0:
