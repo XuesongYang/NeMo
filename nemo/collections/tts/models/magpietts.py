@@ -3553,11 +3553,8 @@ class MagpieTTSModel(ModelPT):
         if is_multi_dataloader:
             # Multiple dataloaders - compute and log both per-dataloader AND averaged metrics
 
-            all_losses = []
-            all_codebook_losses = []
-            all_alignment_losses = []
-            all_aligner_encoder_losses = []
-            all_local_transformer_losses = []
+            # Use dict to aggregate metrics across dataloaders.
+            aggregated_metrics = {}
 
             # Process each dataloader
             for dataloader_idx, val_outputs in enumerate(self.validation_step_outputs):
@@ -3574,52 +3571,25 @@ class MagpieTTSModel(ModelPT):
                 # Get dataset name prefix
                 dataloader_prefix = self.get_validation_dataloader_prefix(dataloader_idx)
 
-                # Extract metrics from result
+                # Log per-dataloader metrics and collect for averaging
                 for metric_name, metric_value in dataloader_logs.items():
-                    # Log per-dataloader metric with prefix
                     self.log(f"Loss:{dataloader_prefix}/{metric_name}", metric_value, prog_bar=False, sync_dist=True)
-
-                    # Collect for averaging
-                    if metric_name == 'loss':
-                        all_losses.append(metric_value)
-                    elif metric_name == 'codebook_loss':
-                        all_codebook_losses.append(metric_value)
-                    elif metric_name == 'alignment_loss':
-                        all_alignment_losses.append(metric_value)
-                    elif metric_name == 'aligner_encoder_loss':
-                        all_aligner_encoder_losses.append(metric_value)
-                    elif metric_name == 'local_transformer_loss':
-                        all_local_transformer_losses.append(metric_value)
+                    aggregated_metrics.setdefault(metric_name, []).append(metric_value)
 
                 # Clear outputs for this dataloader
                 self.validation_step_outputs[dataloader_idx].clear()
 
+            # Validate required metrics were collected
+            for required_metric in ['loss', 'codebook_loss']:
+                if required_metric not in aggregated_metrics or len(aggregated_metrics[required_metric]) == 0:
+                    raise ValueError(f"No {required_metric} collected from any dataloader.")
+
             # Compute and log averaged metrics
-            if len(all_losses) == 0:
-                raise ValueError("No validation losses collected from any dataloader.")
-            if len(all_codebook_losses) == 0:
-                raise ValueError("No codebook losses collected from any dataloader.")
-
-            avg_val_loss = torch.stack(all_losses).mean()
-            avg_codebook_loss = torch.stack(all_codebook_losses).mean()
-
-            self.log("Loss:val_avg/loss", avg_val_loss, prog_bar=True, sync_dist=True)
-            self.log("Loss:val_avg/codebook_loss", avg_codebook_loss, prog_bar=True, sync_dist=True)
-
-            # Log optional averaged metrics
-            if len(all_alignment_losses) > 0:
-                avg_alignment_loss = torch.stack(all_alignment_losses).mean()
-                self.log("Loss:val_avg/alignment_loss", avg_alignment_loss, prog_bar=True, sync_dist=True)
-
-            if len(all_aligner_encoder_losses) > 0:
-                avg_aligner_encoder_loss = torch.stack(all_aligner_encoder_losses).mean()
-                self.log("Loss:val_avg/aligner_encoder_loss", avg_aligner_encoder_loss, prog_bar=True, sync_dist=True)
-
-            if len(all_local_transformer_losses) > 0:
-                avg_local_transformer_loss = torch.stack(all_local_transformer_losses).mean()
-                self.log(
-                    "Loss:val_avg/local_transformer_loss", avg_local_transformer_loss, prog_bar=True, sync_dist=True
-                )
+            for metric_name, metric_values in aggregated_metrics.items():
+                avg_value = torch.stack(metric_values).mean()
+                self.log(f"Loss:val_avg/{metric_name}", avg_value, prog_bar=True, sync_dist=True)
+                if metric_name == 'loss':
+                    avg_val_loss = avg_value
 
             # Log avg val_loss for checkpointing (without logger to avoid duplication)
             self.log(
