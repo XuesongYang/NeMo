@@ -345,6 +345,10 @@ class MagpieTTSModel(ModelPT):
             codec_model = AudioCodecModel.restore_from(
                 codec_model_path, strict=False, override_config_path=codec_model_cfg
             )
+        self.sample_rate = codec_model.sample_rate
+        self.output_sample_rate = codec_model.output_sample_rate
+        self.codec_model_samples_per_frame = codec_model.samples_per_frame
+        # del codec discriminator to free memory
         del codec_model.discriminator
 
         # When using FSQ tokens, the codebook structure can be changed at any time.
@@ -499,19 +503,15 @@ class MagpieTTSModel(ModelPT):
             # Regular text embedding
             self.text_embedding = nn.Embedding(num_tokens, cfg.embedding_dim)
 
-        # Create encoder (filter out MoE loss coefficients if present)
-        # Note: Loss coefficients are model-level config, not passed to Transformer module
+        # Create encoder (filter out MoE loss coefficients - they are model-level config)
         encoder_cfg = dict(cfg.encoder)
-        encoder_cfg.pop('router_aux_loss_coeff', None)  # Old name (backward compat)
-        encoder_cfg.pop('router_load_balancing_loss_coeff', None)  # New name
+        encoder_cfg.pop('router_load_balancing_loss_coeff', None)
         encoder_cfg.pop('router_z_loss_coeff', None)
         self.encoder = transformer_2501.Transformer(**encoder_cfg)
 
-        # Create decoder (filter out MoE loss coefficients if present)
-        # Note: Loss coefficients are model-level config, not passed to Transformer module
+        # Create decoder (filter out MoE loss coefficients - they are model-level config)
         decoder_cfg = dict(cfg.decoder)
-        decoder_cfg.pop('router_aux_loss_coeff', None)  # Old name (backward compat)
-        decoder_cfg.pop('router_load_balancing_loss_coeff', None)  # New name
+        decoder_cfg.pop('router_load_balancing_loss_coeff', None)
         decoder_cfg.pop('router_z_loss_coeff', None)
         self.decoder = transformer_2501.Transformer(**decoder_cfg)
 
@@ -572,8 +572,7 @@ class MagpieTTSModel(ModelPT):
             # Create context encoder (filter out MoE loss coefficients if present)
             # Note: Loss coefficients are model-level config, not passed to Transformer module
             context_encoder_cfg = dict(cfg.context_encoder)
-            context_encoder_cfg.pop('router_aux_loss_coeff', None)  # Old name (backward compat)
-            context_encoder_cfg.pop('router_load_balancing_loss_coeff', None)  # New name
+            context_encoder_cfg.pop('router_load_balancing_loss_coeff', None)
             context_encoder_cfg.pop('router_z_loss_coeff', None)
             self.context_encoder = transformer_2501.Transformer(**context_encoder_cfg)
         elif self.model_type == 'decoder_context_tts':
@@ -584,9 +583,7 @@ class MagpieTTSModel(ModelPT):
         elif self.model_type == 'decoder_ce':
             # Similar to decoder_context_tts, but we use context encoder
             # Decoder gets output from context encoder instead of raw context tokens embeddings
-            # Note: Loss coefficients are model-level config, not passed to Transformer module
             context_encoder_cfg = dict(cfg.context_encoder)
-            context_encoder_cfg.pop('router_aux_loss_coeff', None)  # Old name (backward compat)
             context_encoder_cfg.pop('router_load_balancing_loss_coeff', None)  # New name
             context_encoder_cfg.pop('router_z_loss_coeff', None)
             self.context_encoder = transformer_2501.Transformer(**context_encoder_cfg)
@@ -616,13 +613,7 @@ class MagpieTTSModel(ModelPT):
             num_experts = cfg.decoder.get('num_experts', 8)
             routing_strategy = cfg.decoder.get('routing_strategy', 'top_k')
 
-            # Backward compatibility: handle old parameter name from commit 3e0763fe80e6
-            # Old checkpoints used 'router_aux_loss_coeff', new ones use 'router_load_balancing_loss_coeff'
-            if hasattr(cfg.decoder, 'router_aux_loss_coeff'):
-                router_load_balancing_loss_coeff = cfg.decoder.router_aux_loss_coeff
-                logging.info("Backward compatibility: Using 'router_aux_loss_coeff' from old checkpoint")
-            else:
-                router_load_balancing_loss_coeff = cfg.decoder.get('router_load_balancing_loss_coeff', 0.01)
+            router_load_balancing_loss_coeff = cfg.decoder.get('router_load_balancing_loss_coeff', 0.01)
 
             router_z_loss_coeff = cfg.decoder.get('router_z_loss_coeff', 0.001)
 

@@ -89,7 +89,7 @@ class MoERouter(torch.nn.Module):
         # Compute routing probabilities
         # Note: For padded positions with zero logits [0,0,...,0], softmax gives uniform distribution [1/n,...,1/n]
         # This is fine - we need valid probabilities for top-k selection and normalization
-        # Sinkhorn routing is only applied during training (following Megatron-LM design)
+        # Sinkhorn routing is only applied during training
         # During inference, use softmax for speed (load balancing doesn't matter with small batches)
         if self.routing_strategy == "sinkhorn" and self.training:
             router_probs = self._sinkhorn_routing(router_logits, x_mask)
