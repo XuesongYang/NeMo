@@ -610,6 +610,12 @@ class MagpieInferenceRunner:
             batch_size = len(batch['chunked_tokens'])
             max_num_chunks = max(len(tokens) for tokens in batch['chunked_tokens'])
 
+            # Clear stale KV cache from prior inference calls (e.g., the previous batch or dataset
+            # may have left with populated tensors).
+            self.model.decoder.reset_cache(use_cache=self.model.use_kv_cache_for_inference)
+            if hasattr(self.model, 'local_transformer'):
+                self.model.local_transformer.reset_cache(use_cache=self.model.use_kv_cache_for_inference)
+
             # Create longform chunk state for this batch
             chunk_state = self.model.create_longform_chunk_state(batch_size=batch_size)
 
