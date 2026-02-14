@@ -1,8 +1,12 @@
-name: Magpie-TTS
+name: MagpieTTS-MoE
 
 quadratic_duration: 20  # both training and validation datasets can apply same quadratic_duration.
+
 model:
   use_lhotse: true
+  use_moe: true  # Enable Mixture-of-Experts in decoder (MoE is only supported in decoder)
+  router_load_balancing_loss_coeff: 0.01  # Encourages uniform token distribution across experts (set 0.001 to 0.01 for top_k, 0.0 for sinkhorn)
+  router_z_loss_coeff: 0.001  # Encourages smaller router logits for numerical stability (set 0.0001 to 0.001)
   model_type: "decoder_ce" # decoder_context_tts or decoder_ce
   use_text_conditioning_encoder: true # Enable or disable text context. Audio context is always enabled
   text_conditioning_tokenizer_name: text_ce_tokenizer # The tokenizer to be used for text contexts
@@ -16,7 +20,7 @@ model:
   alignment_loss_scale: 0.002
   embedding_dim: 768
   codecmodel_path: ???
-  cfg_unconditional_prob: 0.1
+  cfg_unconditional_prob: 0.1  # enable classifier-free guidance during traing by dropping out conditionals with this probability
 
   # Alignment encoder parameters, to binarize the prior
   # This is used for attention-constrained training and inference
@@ -149,9 +153,10 @@ model:
     use_learnable_pos_emb: true
 
   decoder:
+    use_moe: ${model.use_moe}
     n_layers: 12
     d_model: 768
-    d_ffn: 3072
+    d_ffn: 1536  # Per-expert FFN hidden dimension. Set to 1536 (=3072/top_k) for FLOPs-matched MoE, or 3072 for full-capacity experts (2x inference FLOPs vs dense).
     sa_n_heads: 12
     kernel_size: 1
     p_dropout: 0.1
@@ -166,6 +171,22 @@ model:
     max_length_causal_mask: 2048
     use_learnable_pos_emb: true
     make_prior_window_strict: false
+    num_experts: 8  # num of expert networks in each MoE layer
+    
+    # Number of experts to activate per token (top-k routing)
+    # top_k=1: Switch Transformer (fastest, most efficient)
+    # top_k=2: Better quality, slightly slower
+    top_k_experts: 2
+    
+    # Routing strategy: "top_k" or "sinkhorn"
+    # - "top_k": Standard softmax routing with top-k selection
+    # - "sinkhorn": Balanced routing
+    routing_strategy: "top_k"
+    
+    # Router jitter noise for exploration during training
+    # Adds noise to router logits to encourage exploration
+    # Recommended: 0.0 to 0.01
+    router_jitter_noise: 0.01
 
   optim:
     _target_: torch.optim.AdamW
@@ -183,10 +204,9 @@ trainer:
   precision: 32
   max_steps: ???
   accumulate_grad_batches: 1
-  enable_checkpointing: False # Provided by exp_manager
-  logger: false # Provided by exp_manager
+  enable_checkpointing: false  # Provided by exp_manager
+  logger: false  # Provided by exp_manager
   log_every_n_steps: 100
-  check_val_every_n_epoch: 1
   limit_train_batches: 1_000
   val_check_interval: 1_000
   num_sanity_val_steps: 0
