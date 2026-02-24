@@ -16,8 +16,10 @@ import json
 import os
 import random
 import time
+import warnings
 from dataclasses import dataclass, field, fields
 from functools import partial
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -25,9 +27,10 @@ import soundfile as sf
 import torch
 import wandb
 from hydra.utils import instantiate
+from lhotse.serialization import load_yaml
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from torch import nn
 from torch.utils.data import get_worker_info
 
@@ -292,6 +295,29 @@ class ModelInferenceParameters:
         if 'lookahead_window_size' in data:
             filtered_data['attention_prior_lookahead_window'] = data['lookahead_window_size']
         return cls(**filtered_data)
+
+
+@dataclass
+class ValidationMediaData:
+    """Data container for media logging during validation.
+
+    This dataclass groups all the data needed for logging audio examples and
+    attention images to WandB and TensorBoard during validation.
+
+    Attributes:
+        dataset_prefix: Prefix for log keys (e.g., 'val', 'val_set_0').
+        pred_audios: List of predicted audio waveforms as numpy arrays.
+        target_audios: List of target audio waveforms as numpy arrays.
+        context_audios: List of context audio waveforms (or None if unavailable).
+        attention_data: Dict mapping attention names to lists of numpy images.
+            Keys like 'overall', 'layer_0', 'aligner_encoder_attn' map to image lists.
+    """
+
+    dataset_prefix: str
+    pred_audios: List[np.ndarray]
+    target_audios: List[np.ndarray]
+    context_audios: List[Optional[np.ndarray]]
+    attention_data: Dict[str, List[np.ndarray]]
 
 
 def worker_init_fn(worker_id):
@@ -1777,128 +1803,247 @@ class MagpieTTSModel(ModelPT):
         all_preds = torch.stack(all_preds, dim=2)  # (B, num_codebooks, frame_stacking_factor)
         return all_preds
 
-    def log_attention_probs(self, attention_prob_matrix, audio_codes_lens, text_lens, prefix="", dec_context_size=0):
-        # attention_prob_matrix List of (B, C, audio_timesteps, text_timesteps)
-        wandb_images_log = {}
+    def _prepare_attention_images(
+        self,
+        attention_prob_matrix: List[torch.Tensor],
+        audio_codes_lens: torch.Tensor,
+        text_lens: torch.Tensor,
+        dec_context_size: int = 0,
+        max_examples: int = 3,
+    ) -> List[np.ndarray]:
+        """
+        Convert attention probability matrices to numpy images for logging.
 
+        Args:
+            attention_prob_matrix: List of attention tensors, each (B, H, audio_timesteps, text_timesteps).
+            audio_codes_lens: Audio sequence lengths per example.
+            text_lens: Text sequence lengths per example.
+            dec_context_size: Number of context audio frames to skip in attention visualization.
+            max_examples: Maximum number of examples to generate images for.
+
+        Returns:
+            List of numpy arrays in HWC format, one per example.
+        """
         with torch.no_grad():
+            # Concatenate attention heads and average
             attention_prob_matrix = torch.cat(attention_prob_matrix, dim=1)  # (B, C, audio_timesteps, text_timesteps)
             attention_prob_matrix_mean = attention_prob_matrix.mean(dim=1)  # (B, audio_timesteps, text_timesteps)
 
-            for logger in self.loggers:
-                is_wandb = isinstance(logger, WandbLogger)
-                is_tb = isinstance(logger, TensorBoardLogger)
-                if not is_wandb and not is_tb:
-                    raise ValueError(
-                        f"Invalid logger type for image logging: {type(logger)}. Only `WandbLogger` and `TensorBoardLogger` are supported."
-                    )
+            images = []
+            num_examples = min(max_examples, attention_prob_matrix_mean.size(0))
+            for idx in range(num_examples):
+                # Slice attention matrix to valid region (excluding context frames)
+                audio_len = int(audio_codes_lens[idx])
+                text_len = int(text_lens[idx])
+                item_attn_matrix = attention_prob_matrix_mean[idx][
+                    dec_context_size : dec_context_size + audio_len, :text_len
+                ]
+                item_attn_matrix = item_attn_matrix.detach().cpu().numpy()
+                img_np = plot_alignment_to_numpy(item_attn_matrix.T)
+                images.append(img_np)
 
-                wandb_images_log[f"Image/{prefix}/attention_matrix"] = list()
-                for idx in range(min(3, attention_prob_matrix_mean.size(0))):
-                    item_attn_matrix = attention_prob_matrix_mean[idx][
-                        dec_context_size : dec_context_size + audio_codes_lens[idx], : text_lens[idx]
-                    ]
-                    item_attn_matrix = item_attn_matrix.detach().cpu().numpy()
-                    img_np = plot_alignment_to_numpy(item_attn_matrix.T)
+            return images
 
-                    if is_wandb:
-                        wandb_images_log[f"Image/{prefix}/attention_matrix"].append(
-                            wandb.Image(img_np, caption=f"Example_{idx}")
-                        )
-
-                    if is_tb:
-                        logger.experiment.add_image(
-                            f'{prefix}/attention_matrix/Example_{idx}',
-                            img_np,
-                            global_step=self.global_step,
-                            dataformats="HWC",
-                        )
-
-        return wandb_images_log
-
-    def log_val_audio_example(
+    def _prepare_audio_examples(
         self,
-        logits,
-        target_audio_codes,
-        audio_codes_lens,
-        context_audio_codes=None,
-        context_audio_codes_lens=None,
-    ):
-        wandb_audio_log = {}
+        logits: torch.Tensor,
+        target_audio_codes: torch.Tensor,
+        audio_codes_lens: torch.Tensor,
+        context_audio_codes: Optional[torch.Tensor] = None,
+        context_audio_codes_lens: Optional[torch.Tensor] = None,
+        max_examples: int = 3,
+    ) -> Dict[str, List[Optional[np.ndarray]]]:
+        """
+        Decode audio codes to waveforms and convert to numpy arrays for logging.
 
-        pred_audio_codes = self.logits_to_audio_codes(logits, audio_codes_lens)
-        pred_audio_codes, audio_codes_lens_pred = self.remove_eos_token(
-            codes=pred_audio_codes, codes_len=audio_codes_lens
-        )
-        pred_audio, pred_audio_lens, _ = self.codes_to_audio(pred_audio_codes, audio_codes_lens_pred)
+        Args:
+            logits: Model output logits to convert to predicted audio.
+            target_audio_codes: Ground truth audio codes.
+            audio_codes_lens: Lengths of target audio codes.
+            context_audio_codes: Optional context audio codes for voice cloning.
+            context_audio_codes_lens: Lengths of context audio codes.
+            max_examples: Maximum number of examples to process.
 
-        target_audio_codes, audio_codes_lens_target = self.remove_eos_token(
-            codes=target_audio_codes, codes_len=audio_codes_lens
-        )
-        target_audio, target_audio_lens, _ = self.codes_to_audio(target_audio_codes, audio_codes_lens_target)
-
-        context_audio, context_audio_lens = None, None
-        if context_audio_codes is not None and context_audio_codes.shape[2] > 3:
-            context_audio_codes, context_audio_codes_lens = self.remove_special_tokens(
-                codes=context_audio_codes, codes_len=context_audio_codes_lens
+        Returns:
+            Dict with keys 'pred_audios', 'target_audios', 'context_audios',
+            each containing a list of numpy arrays (or None for context if unavailable).
+        """
+        with torch.no_grad():
+            # Decode predictions: convert logits to codes, remove EOS token, then decode to audio
+            pred_audio_codes = self.logits_to_audio_codes(logits, audio_codes_lens)
+            pred_audio_codes, pred_audio_codes_lens = self.remove_eos_token(
+                codes=pred_audio_codes, codes_len=audio_codes_lens
             )
-            # > 3 ensures, it is a valid context audio tensor (and not dummy tensor used in text context)
-            # This does not handle the case in which a batch has a mixture of text and audio context examples
-            context_audio, context_audio_lens, _ = self.codes_to_audio(context_audio_codes, context_audio_codes_lens)
+            pred_audio, pred_audio_lens, _ = self.codes_to_audio(pred_audio_codes, pred_audio_codes_lens)
 
+            # Decode targets: remove EOS token, then decode to audio
+            target_audio_codes, target_audio_codes_lens = self.remove_eos_token(
+                codes=target_audio_codes, codes_len=audio_codes_lens
+            )
+            target_audio, target_audio_lens, _ = self.codes_to_audio(target_audio_codes, target_audio_codes_lens)
+
+            # Decode context audio if available (shape check ensures it's not a dummy tensor used in text context)
+            context_audio, context_audio_lens = None, None
+            if context_audio_codes is not None and context_audio_codes.shape[2] > 3:
+                context_audio_codes, context_audio_codes_lens = self.remove_special_tokens(
+                    codes=context_audio_codes, codes_len=context_audio_codes_lens
+                )
+                context_audio, context_audio_lens, _ = self.codes_to_audio(
+                    context_audio_codes, context_audio_codes_lens
+                )
+
+            pred_audios = []
+            target_audios = []
+            context_audios = []
+
+            num_examples = min(max_examples, pred_audio.size(0))
+            for idx in range(num_examples):
+                # Convert to numpy and trim to actual length
+                pred_audio_np = pred_audio[idx, : pred_audio_lens[idx]].float().cpu().numpy()
+                target_audio_np = target_audio[idx, : target_audio_lens[idx]].float().cpu().numpy()
+
+                pred_audios.append(pred_audio_np)
+                target_audios.append(target_audio_np)
+
+                if context_audio is not None:
+                    context_audio_np = context_audio[idx, : context_audio_lens[idx]].float().cpu().numpy()
+                    context_audios.append(context_audio_np)
+                else:
+                    context_audios.append(None)
+
+            return {
+                'pred_audios': pred_audios,
+                'target_audios': target_audios,
+                'context_audios': context_audios,
+            }
+
+    def _log_media_to_wandb_and_tb(self, media_data: ValidationMediaData, global_step: int) -> None:
+        """
+        Log audio examples and attention images to WandB and/or TensorBoard.
+
+        This method creates wandb.Audio/wandb.Image objects and logs them.
+        It batches all WandB logs into a single call for efficiency.
+
+        Args:
+            media_data: ValidationMediaData containing audio waveforms and attention images.
+            global_step: Current training step for logging.
+        """
         for logger in self.loggers:
             is_wandb = isinstance(logger, WandbLogger)
             is_tb = isinstance(logger, TensorBoardLogger)
             if not is_wandb and not is_tb:
                 raise ValueError(
-                    f"Invalid logger type for audio logging: {type(logger)}. Only `WandbLogger` and `TensorBoardLogger` are supported."
+                    f"Unsupported logger type: {type(logger)}. "
+                    f"Only WandbLogger and TensorBoardLogger are supported for media logging."
                 )
 
-            for idx in range(min(3, pred_audio.size(0))):
-                pred_audio_np = pred_audio[idx].float().detach().cpu().numpy()
-                target_audio_np = target_audio[idx].float().detach().cpu().numpy()
-                pred_audio_np = pred_audio_np[: pred_audio_lens[idx]]
-                target_audio_np = target_audio_np[: target_audio_lens[idx]]
-                context_audio_np = None
-                if context_audio is not None:
-                    context_audio_np = context_audio[idx].float().detach().cpu().numpy()
-                    context_audio_np = context_audio_np[: context_audio_lens[idx]]
+            wandb_log_dict = {}
 
+            # Log audio examples
+            for idx, (pred_audio_np, target_audio_np, context_audio_np) in enumerate(
+                zip(media_data.pred_audios, media_data.target_audios, media_data.context_audios)
+            ):
                 if is_wandb:
-                    wandb_audio_log[f"Audio/Example_{idx}"] = list()
+                    audio_list = []
                     if context_audio_np is not None and context_audio_np.shape[0] > 0:
-                        wandb_audio_log[f"Audio/Example_{idx}"].append(
+                        audio_list.append(
                             wandb.Audio(context_audio_np, sample_rate=self.output_sample_rate, caption="context")
                         )
-                    wandb_audio_log[f"Audio/Example_{idx}"].append(
+                    audio_list.append(
                         wandb.Audio(pred_audio_np, sample_rate=self.output_sample_rate, caption="prediction")
                     )
-                    wandb_audio_log[f"Audio/Example_{idx}"].append(
+                    audio_list.append(
                         wandb.Audio(target_audio_np, sample_rate=self.output_sample_rate, caption="target")
                     )
+                    wandb_log_dict[f"Audio:{media_data.dataset_prefix}/Example_{idx}"] = audio_list
 
                 if is_tb:
                     if context_audio_np is not None and context_audio_np.shape[0] > 0:
                         logger.experiment.add_audio(
-                            f'Example_{idx}/context',
+                            f'{media_data.dataset_prefix}/Example_{idx}/context',
                             context_audio_np,
-                            global_step=self.global_step,
+                            global_step=global_step,
                             sample_rate=self.output_sample_rate,
                         )
                     logger.experiment.add_audio(
-                        f'Example_{idx}/prediction',
+                        f'{media_data.dataset_prefix}/Example_{idx}/prediction',
                         pred_audio_np,
-                        global_step=self.global_step,
+                        global_step=global_step,
                         sample_rate=self.output_sample_rate,
                     )
                     logger.experiment.add_audio(
-                        f'Example_{idx}/target',
+                        f'{media_data.dataset_prefix}/Example_{idx}/target',
                         target_audio_np,
-                        global_step=self.global_step,
+                        global_step=global_step,
                         sample_rate=self.output_sample_rate,
                     )
 
-        return wandb_audio_log
+            # Log attention images
+            for attn_key, images in media_data.attention_data.items():
+                # Determine log prefix: 'overall' uses dataset_prefix directly, others are nested
+                if attn_key == 'overall':
+                    prefix = media_data.dataset_prefix
+                else:
+                    prefix = f"{media_data.dataset_prefix}/{attn_key}"
+
+                if is_wandb:
+                    wandb_log_dict[f"Image:{prefix}/attention_matrix"] = [
+                        wandb.Image(img_np, caption=f"Example_{idx}") for idx, img_np in enumerate(images)
+                    ]
+
+                if is_tb:
+                    for idx, img_np in enumerate(images):
+                        logger.experiment.add_image(
+                            f'{prefix}/attention_matrix/Example_{idx}',
+                            img_np,
+                            global_step=global_step,
+                            dataformats="HWC",
+                        )
+
+            # Perform single wandb log call
+            if is_wandb and wandb_log_dict:
+                logger.experiment.log(wandb_log_dict)
+
+    def _log_moe_expert_usage(self, moe_expert_usage_stats: Dict, dataset_prefix: str) -> None:
+        """Log MoE expert usage statistics (bar charts, scalar metrics) to WandB."""
+        expert_usage = moe_expert_usage_stats['expert_usage'].numpy()
+        expert_selection_freq = moe_expert_usage_stats['expert_selection_freq'].numpy()
+        expert_names = [f"Expert_{i}" for i in range(len(expert_usage))]
+
+        for logger in self.loggers:
+            if isinstance(logger, WandbLogger):
+                wandb_moe_log = {}
+
+                usage_data = [[name, usage] for name, usage in zip(expert_names, expert_usage)]
+                wandb_moe_log[f'MoE:{dataset_prefix}/expert_usage_distribution'] = wandb.plot.bar(
+                    wandb.Table(data=usage_data, columns=["Expert", "Usage"]),
+                    "Expert",
+                    "Usage",
+                    title=f"Expert Usage ({dataset_prefix})",
+                )
+
+                selection_data = [[name, freq] for name, freq in zip(expert_names, expert_selection_freq)]
+                wandb_moe_log[f'MoE:{dataset_prefix}/expert_selection_frequency'] = wandb.plot.bar(
+                    wandb.Table(data=selection_data, columns=["Expert", "Frequency"]),
+                    "Expert",
+                    "Frequency",
+                    title=f"Expert Selection Frequency ({dataset_prefix}, Top-{self.decoder.top_k_experts})",
+                )
+
+                wandb_moe_log[f'MoE:{dataset_prefix}/batch_expert_usage_variance'] = moe_expert_usage_stats[
+                    'batch_expert_usage_variance'
+                ]
+                wandb_moe_log[f'MoE:{dataset_prefix}/batch_expert_usage_max'] = moe_expert_usage_stats[
+                    'batch_expert_usage_max'
+                ]
+                wandb_moe_log[f'MoE:{dataset_prefix}/batch_expert_usage_min'] = moe_expert_usage_stats[
+                    'batch_expert_usage_min'
+                ]
+
+                for expert_idx, usage in enumerate(expert_usage):
+                    wandb_moe_log[f'MoE:{dataset_prefix}/expert_{expert_idx}_usage'] = float(usage)
+
+                logger.experiment.log(wandb_moe_log)
 
     def scale_prior(self, prior, global_step):
         if prior is None:
@@ -2727,17 +2872,17 @@ class MagpieTTSModel(ModelPT):
         batch_output = self.process_batch(batch)
         loss = batch_output['loss']
         codebook_loss = batch_output['codebook_loss']
-        self.log('train/codebook_loss', codebook_loss, prog_bar=True, sync_dist=True)
+        self.log('Loss:train/codebook_loss', codebook_loss, prog_bar=True, sync_dist=True)
         if self.cfg_unconditional_prob == 0.0:
             # Only log alignment loss when not using cfg to avoid sync issues when
             # alignment loss is None on some ranks
             alignment_loss = batch_output['alignment_loss']
             if alignment_loss is not None:
-                self.log('train/alignment_loss', alignment_loss, prog_bar=True, sync_dist=True)
-        self.log('train/loss', loss, prog_bar=True, sync_dist=True)
+                self.log('Loss:train/alignment_loss', alignment_loss, prog_bar=True, sync_dist=True)
+        self.log('Loss:train/loss', loss, prog_bar=True, sync_dist=True)
         local_transformer_loss = batch_output['local_transformer_loss']
         if local_transformer_loss is not None:
-            self.log('train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
+            self.log('Loss:train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
 
         # Log MoE losses if MoE is enabled
         moe_load_balancing_loss = batch_output.get('moe_load_balancing_loss', None)
@@ -2751,10 +2896,10 @@ class MagpieTTSModel(ModelPT):
         batch_size, text_token_max_len = batch["text"].shape
         text_token_total_num = batch["text_lens"].sum()
         batch_info_dict = {
-            "train/batch_size": batch_size,
-            "train/text_token_max_len": text_token_max_len,
-            "train/text_token_total_num_in_batch": text_token_total_num.item(),
-            "train/text_token_pad_ratio_percent_in_batch": 100
+            "BatchInfo:train/batch_size": batch_size,
+            "BatchInfo:train/text_token_max_len": text_token_max_len,
+            "BatchInfo:train/text_token_total_num_in_batch": text_token_total_num.item(),
+            "BatchInfo:train/text_token_pad_ratio_percent_in_batch": 100
             * (1 - text_token_total_num / (batch_size * text_token_max_len)),
         }
 
@@ -2763,9 +2908,9 @@ class MagpieTTSModel(ModelPT):
             audio_codes_total_num = batch["audio_codes_lens"].sum()
             batch_info_dict.update(
                 {
-                    "train/audio_codes_max_len": audio_codes_max_len,
-                    "train/audio_codes_total_num_in_batch": audio_codes_total_num.item(),
-                    "train/audio_codes_pad_ratio_percent_in_batch": 100
+                    "BatchInfo:train/audio_codes_max_len": audio_codes_max_len,
+                    "BatchInfo:train/audio_codes_total_num_in_batch": audio_codes_total_num.item(),
+                    "BatchInfo:train/audio_codes_pad_ratio_percent_in_batch": 100
                     * (1 - audio_codes_total_num / (batch_size * audio_codes_max_len)),
                 }
             )
@@ -2774,9 +2919,9 @@ class MagpieTTSModel(ModelPT):
             audio_samples_total_num = batch["audio_lens"].sum()
             batch_info_dict.update(
                 {
-                    "train/audio_samples_max_len": audio_samples_max_len,
-                    "train/audio_samples_total_num_in_batch": audio_samples_total_num.item(),
-                    "train/audio_samples_pad_ratio_percent_in_batch": 100
+                    "BatchInfo:train/audio_samples_max_len": audio_samples_max_len,
+                    "BatchInfo:train/audio_samples_total_num_in_batch": audio_samples_total_num.item(),
+                    "BatchInfo:train/audio_samples_pad_ratio_percent_in_batch": 100
                     * (1 - audio_samples_total_num / (batch_size * audio_samples_max_len)),
                 }
             )
@@ -2785,14 +2930,24 @@ class MagpieTTSModel(ModelPT):
 
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        """
+        Validation step with support for multiple dataloaders.
+
+        Args:
+            batch: Input batch
+            batch_idx: Batch index
+            dataloader_idx: Index of the dataloader (0 for single dataloader)
+        """
         batch_output = self.process_batch(batch)
         # self.process_batch returns a dict. We currently only log "logits" which come from the parallel prediction
         # head. If we use local_transformer, then the local_transformer returns "local_transformer_logits"
+
         loss = batch_output['loss']
         codebook_loss = batch_output['codebook_loss']
         alignment_loss = batch_output['alignment_loss']
         aligner_encoder_loss = batch_output['aligner_encoder_loss']
+        local_transformer_loss = batch_output['local_transformer_loss']
         logits = batch_output['logits']
         audio_codes_target = batch_output['audio_codes_target']
         audio_codes_lens_target = batch_output['audio_codes_lens_target']
@@ -2801,153 +2956,122 @@ class MagpieTTSModel(ModelPT):
         attn_info = batch_output['attn_info']
         text_lens = batch_output['text_lens']
         dec_context_size = batch_output['dec_context_size']
-
-        # Extract MoE losses and expert usage statistics if MoE is enabled
         moe_load_balancing_loss = batch_output.get('moe_load_balancing_loss', None)
         moe_router_z_loss = batch_output.get('moe_router_z_loss', None)
         moe_expert_usage_stats = batch_output.get('moe_expert_usage_stats', None)
 
-        if alignment_loss is None:
-            alignment_loss = torch.tensor(0.0, device=loss.device)
-        if aligner_encoder_loss is None:
-            aligner_encoder_loss = torch.tensor(0.0, device=loss.device)
-        if moe_load_balancing_loss is None:
-            moe_load_balancing_loss = torch.tensor(0.0, device=loss.device)
-        if moe_router_z_loss is None:
-            moe_router_z_loss = torch.tensor(0.0, device=loss.device)
+        val_output = {
+            'val_loss': loss,
+            'val_codebook_loss': codebook_loss,
+        }
 
-        if batch_idx == 0 and self.global_rank == 0:
-            # Log MoE expert usage statistics to WandB (first batch only for visualization)
-            if self.use_moe and moe_expert_usage_stats is not None:
-                wandb_moe_first_batch_log = {}
-
-                # Log per-expert usage as bar chart
-                expert_usage = moe_expert_usage_stats['expert_usage'].numpy()
-                expert_selection_freq = moe_expert_usage_stats['expert_selection_freq'].numpy()
-
-                for logger in self.loggers:
-                    if isinstance(logger, WandbLogger):
-                        # Create bar chart for expert usage (routing probabilities)
-                        expert_names = [f"Expert_{i}" for i in range(len(expert_usage))]
-                        usage_data = [[name, usage] for name, usage in zip(expert_names, expert_usage)]
-                        wandb_moe_first_batch_log['val/expert_usage_distribution'] = wandb.plot.bar(
-                            wandb.Table(data=usage_data, columns=["Expert", "Usage"]),
-                            "Expert",
-                            "Usage",
-                            title="Expert Usage (Routing Probabilities)",
-                        )
-
-                        # Create bar chart for expert selection frequency (top-k selections)
-                        selection_data = [[name, freq] for name, freq in zip(expert_names, expert_selection_freq)]
-                        wandb_moe_first_batch_log['val/expert_selection_frequency'] = wandb.plot.bar(
-                            wandb.Table(data=selection_data, columns=["Expert", "Frequency"]),
-                            "Expert",
-                            "Frequency",
-                            title=f"Expert Selection Frequency (Top-{self.decoder.top_k_experts})",
-                        )
-
-                        # Log scalar metrics for numerical tracking
-                        wandb_moe_first_batch_log['val/batch_expert_usage_variance'] = moe_expert_usage_stats[
-                            'batch_expert_usage_variance'
-                        ]
-                        wandb_moe_first_batch_log['val/batch_expert_usage_max'] = moe_expert_usage_stats[
-                            'batch_expert_usage_max'
-                        ]
-                        wandb_moe_first_batch_log['val/batch_expert_usage_min'] = moe_expert_usage_stats[
-                            'batch_expert_usage_min'
-                        ]
-
-                        # Log individual expert usage percentages as scalars
-                        for idx, usage in enumerate(expert_usage):
-                            wandb_moe_first_batch_log[f'val/expert_{idx}_usage'] = float(usage)
-
-                        logger.experiment.log(wandb_moe_first_batch_log)
-
-        if batch_idx == 0 and self.global_rank == 0:
-            # Prepare dictionary for aggregated wandb logging
-            wandb_log_dict = {}
-
-            # Get audio data for logging
-            wandb_log_dict.update(
-                self.log_val_audio_example(
-                    logits, audio_codes_target, audio_codes_lens_target, context_audio_codes, context_audio_codes_lens
-                )
+        # Only add optional losses if they were computed (not None)
+        if alignment_loss is not None:
+            val_output['val_alignment_loss'] = alignment_loss
+        if local_transformer_loss is not None:
+            val_output['val_local_transformer_loss'] = local_transformer_loss
+        if aligner_encoder_loss is not None:
+            val_output['val_aligner_encoder_loss'] = aligner_encoder_loss
+        if moe_load_balancing_loss is not None:
+            val_output['val_moe_load_balancing_loss'] = moe_load_balancing_loss
+        if moe_router_z_loss is not None:
+            val_output['val_moe_router_z_loss'] = moe_router_z_loss
+        if moe_expert_usage_stats is not None:
+            val_output['val_batch_expert_usage_variance'] = torch.tensor(
+                moe_expert_usage_stats['batch_expert_usage_variance'], device=loss.device
             )
 
-            # Get attention image data for logging
-            if len(attn_info[self.transcript_decoder_layers[0]]['cross_attn_probabilities']) > 1:
-                # cross_attn_probabilities only returned when not using flash attention
+        # Prepare media data for logging (only first batch of each dataloader, rank 0 only).
+        if batch_idx == 0 and self.global_rank == 0:
+            # Determine dataset name for logging prefix
+            dataset_prefix = "val"
+            if self._validation_names is not None:  # multi-dataloader case
+                dataset_prefix = self._validation_names[dataloader_idx]
+
+            # Prepare audio examples (decode via vocoder, convert to numpy)
+            audio_data = self._prepare_audio_examples(
+                logits=logits,
+                target_audio_codes=audio_codes_target,
+                audio_codes_lens=audio_codes_lens_target,
+                context_audio_codes=context_audio_codes,
+                context_audio_codes_lens=context_audio_codes_lens,
+                max_examples=3,
+            )
+
+            # Prepare attention images (only when cross-attention is available)
+            attention_data = {}
+            has_cross_attn = (
+                self.model_type != 'decoder_pretrain_synthesizer'
+                and len(attn_info[self.transcript_decoder_layers[0]].get('cross_attn_probabilities', [])) > 1
+            )
+
+            if has_cross_attn:
+                # Overall attention: average across CTC prior layers
                 cross_attention_probs = [
                     attn['cross_attn_probabilities'][0]
                     for layer_idx, attn in enumerate(attn_info)
                     if layer_idx in self.ctc_prior_layer_ids
                 ]
-                wandb_log_dict.update(
-                    self.log_attention_probs(
-                        cross_attention_probs,
-                        audio_codes_lens_target,
-                        text_lens,
-                        prefix="val",
-                        dec_context_size=dec_context_size,
-                    )
+                attention_data['overall'] = self._prepare_attention_images(
+                    cross_attention_probs,
+                    audio_codes_lens_target,
+                    text_lens,
+                    dec_context_size=dec_context_size,
+                    max_examples=3,
                 )
 
+                # Per-layer attention visualization
                 for layer_idx in self.transcript_decoder_layers:
-                    cross_attention_probs = [attn_info[layer_idx]['cross_attn_probabilities'][0]]
-                    wandb_log_dict.update(
-                        self.log_attention_probs(
-                            cross_attention_probs,
-                            audio_codes_lens_target,
-                            text_lens,
-                            prefix=f"val/layer_{layer_idx}",
-                            dec_context_size=dec_context_size,
-                        )
+                    layer_cross_attention_probs = [attn_info[layer_idx]['cross_attn_probabilities'][0]]
+                    attention_data[f'layer_{layer_idx}'] = self._prepare_attention_images(
+                        layer_cross_attention_probs,
+                        audio_codes_lens_target,
+                        text_lens,
+                        dec_context_size=dec_context_size,
+                        max_examples=3,
                     )
 
+                # Aligner encoder attention (if available)
                 if batch_output['aligner_attn_soft'] is not None:
-                    wandb_log_dict.update(
-                        self.log_attention_probs(
-                            [batch_output['aligner_attn_soft']],
-                            audio_codes_lens_target,
-                            text_lens,
-                            prefix="val/aligner_encoder_attn",
-                        )
+                    attention_data['aligner_encoder_attn'] = self._prepare_attention_images(
+                        [batch_output['aligner_attn_soft']],
+                        audio_codes_lens_target,
+                        text_lens,
+                        dec_context_size=0,
+                        max_examples=3,
                     )
 
                 if batch_output['aligner_attn_hard'] is not None:
-                    wandb_log_dict.update(
-                        self.log_attention_probs(
-                            [batch_output['aligner_attn_hard'].unsqueeze(1)],
-                            audio_codes_lens_target,
-                            text_lens,
-                            prefix="val/aligner_encoder_attn_hard",
-                        )
+                    attention_data['aligner_encoder_attn_hard'] = self._prepare_attention_images(
+                        [batch_output['aligner_attn_hard'].unsqueeze(1)],
+                        audio_codes_lens_target,
+                        text_lens,
+                        dec_context_size=0,
+                        max_examples=3,
                     )
 
-            # Perform single wandb log call if wandb is active and there is data
-            for logger in self.loggers:
-                if isinstance(logger, WandbLogger) and wandb_log_dict:
-                    logger.experiment.log(wandb_log_dict)
-
-        local_transformer_loss = batch_output['local_transformer_loss']
-        val_output = {
-            'val_loss': loss,
-            'val_codebook_loss': codebook_loss,
-            'val_alignment_loss': alignment_loss,
-            'val_local_transformer_loss': local_transformer_loss,
-            'val_aligner_encoder_loss': aligner_encoder_loss,
-            'val_moe_load_balancing_loss': moe_load_balancing_loss,
-            'val_moe_router_z_loss': moe_router_z_loss,
-        }
-
-        # Store expert usage stats for aggregation at epoch end
-        if moe_expert_usage_stats is not None:
-            # Store batch-level variance for aggregation at epoch end
-            val_output['val_batch_expert_usage_variance'] = torch.tensor(
-                moe_expert_usage_stats['batch_expert_usage_variance'], device=loss.device
+            # Store media data as a typed dataclass for cleaner API
+            media_data = ValidationMediaData(
+                dataset_prefix=dataset_prefix,
+                pred_audios=audio_data['pred_audios'],
+                target_audios=audio_data['target_audios'],
+                context_audios=audio_data['context_audios'],
+                attention_data=attention_data,
             )
+            val_output['media_data'] = media_data
 
-        self.validation_step_outputs.append(val_output)
+            # Store MoE expert usage stats for deferred WandB logging
+            if self.use_moe and moe_expert_usage_stats is not None:
+                val_output['moe_expert_usage_stats'] = moe_expert_usage_stats
+
+        # Append to appropriate list based on structure
+        # validation_step_outputs is initialized in ModelPT: [] for single dataloader, [[], [], ...] for multiple dataloaders.
+        if len(self.validation_step_outputs) > 0 and isinstance(self.validation_step_outputs[0], list):
+            # Multiple dataloaders: list of lists
+            self.validation_step_outputs[dataloader_idx].append(val_output)
+        else:
+            # Single dataloader: flat list
+            self.validation_step_outputs.append(val_output)
 
         return val_output
 
@@ -3555,66 +3679,223 @@ class MagpieTTSModel(ModelPT):
                     audio_path = os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}.wav')
                     sf.write(audio_path, predicted_audio_np, self.output_sample_rate)
 
-    def on_validation_epoch_end(self):
-        collect = lambda key: torch.stack([x[key] for x in self.validation_step_outputs]).mean()
-        val_loss = collect("val_loss")
-        val_codebook_loss = collect("val_codebook_loss")
-        val_alignment_loss = collect("val_alignment_loss")
-        val_aligner_encoder_loss = collect("val_aligner_encoder_loss")
+    def multi_validation_epoch_end(
+        self, outputs: List[Dict[str, torch.Tensor]], dataloader_idx: int = 0
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Called for each validation dataloader at the end of validation epoch.
+        Computes metrics for this specific dataloader.
 
-        # log val_loss in the same group as the other val metrics.
-        self.log("val/loss", val_loss, prog_bar=True, sync_dist=True)
-        # ensure val_loss is available for epoch-level checkpointing and filename generation without cluttering wandb logs.
-        self.log(
-            "val_loss",
-            val_loss,
-            prog_bar=False,
-            sync_dist=True,
-            on_step=False,
-            on_epoch=True,
-            logger=False,
-            enable_graph=False,
-        )
-        self.log("val/codebook_loss", val_codebook_loss, prog_bar=True, sync_dist=True)
-        self.log("val/alignment_loss", val_alignment_loss, prog_bar=True, sync_dist=True)
-        self.log("val/aligner_encoder_loss", val_aligner_encoder_loss, prog_bar=True, sync_dist=True)
+        Args:
+            outputs: List of outputs from validation_step for this specific dataloader
+            dataloader_idx: Index of the current dataloader
 
-        if self.local_transformer_type != LocalTransformerType.NO_LT:
-            val_local_transformer_loss = collect("val_local_transformer_loss")
-            self.log("val/local_transformer_loss", val_local_transformer_loss, prog_bar=True, sync_dist=True)
+        Returns:
+            Dictionary with metrics to log
+        """
 
-        # Log MoE losses and expert usage if MoE is enabled
-        if self.use_moe:
-            val_moe_load_balancing_loss = collect("val_moe_load_balancing_loss")
-            val_moe_router_z_loss = collect("val_moe_router_z_loss")
-
-            # Log MoE losses
-            self.log("val/moe_load_balancing_loss", val_moe_load_balancing_loss, prog_bar=True, sync_dist=True)
-            self.log("val/moe_router_z_loss", val_moe_router_z_loss, prog_bar=True, sync_dist=True)
-
-            # Log expert usage variance (averaged across all validation batches)
-            if any('val_batch_expert_usage_variance' in x for x in self.validation_step_outputs):
-                # This is the MEAN of batch-level variances across the epoch
-                val_epoch_mean_expert_usage_variance = collect("val_batch_expert_usage_variance")
-                self.log(
-                    "val/expert_usage_variance_epoch_mean",
-                    val_epoch_mean_expert_usage_variance,
-                    prog_bar=False,
-                    sync_dist=True,
+        def collect_required_metric(outputs, key):
+            values = [x[key] for x in outputs if key in x and x[key] is not None]
+            if len(values) == 0:
+                raise ValueError(
+                    f"No valid values found for required metric '{key}' in validation outputs "
+                    f"for dataloader {dataloader_idx}. This indicates an issue with validation."
                 )
+            return torch.stack(values).mean()
 
-                # Log interpretation hints
-                # Ideal variance for N experts: 0 (perfectly balanced)
-                # High variance (>0.01) indicates imbalanced expert usage
+        def collect_optional_metric(outputs, key):
+            """Collect optional metric - returns None if not found."""
+            values = [x[key] for x in outputs if key in x and x[key] is not None]
+            if len(values) == 0:
+                return None
+            return torch.stack(values).mean()
+
+        if len(outputs) == 0:
+            raise ValueError(
+                f"No validation outputs for dataloader {dataloader_idx}. "
+                f"This indicates an issue with the validation dataloader or validation step."
+            )
+
+        # Compute required metrics
+        val_loss = collect_required_metric(outputs, 'val_loss')
+        val_codebook_loss = collect_required_metric(outputs, 'val_codebook_loss')
+
+        # Compute optional metrics
+        val_alignment_loss = collect_optional_metric(outputs, 'val_alignment_loss')
+        val_aligner_encoder_loss = collect_optional_metric(outputs, 'val_aligner_encoder_loss')
+        val_local_transformer_loss = collect_optional_metric(outputs, 'val_local_transformer_loss')
+        val_moe_load_balancing_loss = collect_optional_metric(outputs, 'val_moe_load_balancing_loss')
+        val_moe_router_z_loss = collect_optional_metric(outputs, 'val_moe_router_z_loss')
+        val_batch_expert_usage_variance = collect_optional_metric(outputs, 'val_batch_expert_usage_variance')
+
+        # Prepare log dict - only include metrics that were computed
+        log_dict = {
+            'loss': val_loss,
+            'codebook_loss': val_codebook_loss,
+        }
+
+        # Add optional metrics if they were computed
+        if val_alignment_loss is not None:
+            log_dict['alignment_loss'] = val_alignment_loss
+        if val_aligner_encoder_loss is not None:
+            log_dict['aligner_encoder_loss'] = val_aligner_encoder_loss
+        if val_local_transformer_loss is not None:
+            log_dict['local_transformer_loss'] = val_local_transformer_loss
+        if val_moe_load_balancing_loss is not None:
+            log_dict['moe_load_balancing_loss'] = val_moe_load_balancing_loss
+        if val_moe_router_z_loss is not None:
+            log_dict['moe_router_z_loss'] = val_moe_router_z_loss
+        if val_batch_expert_usage_variance is not None:
+            log_dict['expert_usage_variance'] = val_batch_expert_usage_variance
+
+        return log_dict
+
+    def on_validation_epoch_end(self):
+        """
+        Computes and logs averaged metrics across all validation dataloaders.
+
+        This method:
+        1. Computes per-dataloader metrics from validation outputs.
+        2. Computes averages across all dataloaders.
+        3. Logs both per-dataloader and averaged metrics:
+           - Per-dataloader: "Loss:<dataset_name>/loss", "Loss:<dataset_name>/codebook_loss", etc.
+           - Averaged (multi-dataloader): "Loss:val_avg/loss", "Loss:val_avg/codebook_loss", etc.
+           - Single dataloader: "Loss:val/loss", "Loss:val/codebook_loss", etc.
+        4. Uses averaged val_loss for checkpointing (logged without logger prefix for ModelCheckpoint).
+        """
+        if self.validation_step_outputs is None or len(self.validation_step_outputs) == 0:
+            return {}
+
+        # Determine if we have multiple dataloaders
+        is_multi_dataloader = isinstance(self.validation_step_outputs[0], list)
+
+        # Log media (audio + attention images) and MoE expert usage from first batch of each dataloader.
+        # Media data was prepared in validation_step; here we just create wandb/tb objects and log.
+        if self.global_rank == 0:
+            global_step = int(self.global_step)
+            if is_multi_dataloader:
+                for val_outputs in self.validation_step_outputs:
+                    if len(val_outputs) > 0:
+                        first_output = val_outputs[0]
+                        if 'media_data' in first_output:
+                            self._log_media_to_wandb_and_tb(first_output['media_data'], global_step)
+                        if 'moe_expert_usage_stats' in first_output:
+                            self._log_moe_expert_usage(
+                                first_output['moe_expert_usage_stats'],
+                                first_output.get(
+                                    'media_data', ValidationMediaData('val', [], [], [], {})
+                                ).dataset_prefix,
+                            )
+            else:
+                if len(self.validation_step_outputs) > 0:
+                    first_output = self.validation_step_outputs[0]
+                    if 'media_data' in first_output:
+                        self._log_media_to_wandb_and_tb(first_output['media_data'], global_step)
+                    if 'moe_expert_usage_stats' in first_output:
+                        self._log_moe_expert_usage(
+                            first_output['moe_expert_usage_stats'],
+                            first_output.get('media_data', ValidationMediaData('val', [], [], [], {})).dataset_prefix,
+                        )
+
+        if is_multi_dataloader:
+            # Multiple dataloaders - compute and log both per-dataloader AND averaged metrics
+
+            # Use dict to aggregate metrics across dataloaders.
+            aggregated_metrics = {}
+
+            # Process each dataloader
+            for dataloader_idx, val_outputs in enumerate(self.validation_step_outputs):
+                if len(val_outputs) == 0:
+                    raise ValueError(
+                        f"Validation dataloader {dataloader_idx} produced no outputs. "
+                        f"This indicates an issue with the dataloader or validation data. "
+                        f"Check that the dataset is not empty and validation_step is working correctly."
+                    )
+
+                # Call multi_validation_epoch_end to get metrics for this dataloader
+                dataloader_logs = self.multi_validation_epoch_end(val_outputs, dataloader_idx=dataloader_idx)
+
+                # Get dataset name prefix
+                dataloader_prefix = self.get_validation_dataloader_prefix(dataloader_idx)
+
+                # Log per-dataloader metrics and collect for averaging
+                for metric_name, metric_value in dataloader_logs.items():
+                    self.log(f"Loss:{dataloader_prefix}/{metric_name}", metric_value, prog_bar=False, sync_dist=True)
+                    aggregated_metrics.setdefault(metric_name, []).append(metric_value)
+
+                # Clear outputs for this dataloader
+                self.validation_step_outputs[dataloader_idx].clear()
+
+            # Validate required metrics were collected
+            for required_metric in ['loss', 'codebook_loss']:
+                if required_metric not in aggregated_metrics or len(aggregated_metrics[required_metric]) == 0:
+                    raise ValueError(f"No {required_metric} collected from any dataloader.")
+
+            # Compute and log averaged metrics
+            for metric_name, metric_values in aggregated_metrics.items():
+                avg_value = torch.stack(metric_values).mean()
+                self.log(f"Loss:val_avg/{metric_name}", avg_value, prog_bar=True, sync_dist=True)
+                if metric_name == 'loss':
+                    avg_val_loss = avg_value
+
+            # Log MoE expert usage variance interpretation
+            if 'expert_usage_variance' in aggregated_metrics:
+                avg_expert_usage_var = torch.stack(aggregated_metrics['expert_usage_variance']).mean()
                 num_experts = self.cfg.decoder.get('num_experts', 8)
                 ideal_usage = 1.0 / num_experts
                 logging.info(
                     f"MoE Expert Usage (Epoch Mean) - Ideal: {ideal_usage:.4f} per expert, "
-                    f"Variance: {val_epoch_mean_expert_usage_variance:.6f} "
-                    f"({'Balanced' if val_epoch_mean_expert_usage_variance < 0.01 else 'Imbalanced'})"
+                    f"Variance: {avg_expert_usage_var:.6f} "
+                    f"({'Balanced' if avg_expert_usage_var < 0.01 else 'Imbalanced'})"
                 )
 
-        self.validation_step_outputs.clear()  # free memory
+            # Log avg val_loss for checkpointing (without logger to avoid duplication)
+            self.log(
+                "val_loss",
+                avg_val_loss,
+                prog_bar=False,
+                sync_dist=True,
+                on_step=False,
+                on_epoch=True,
+                logger=False,
+                enable_graph=False,
+            )
+
+            return {}
+
+        else:
+            # Single dataloader - reuse multi_validation_epoch_end logic
+            dataloader_logs = self.multi_validation_epoch_end(self.validation_step_outputs, dataloader_idx=0)
+
+            # Log all metrics with "Loss:val/" prefix
+            for metric_name, metric_value in dataloader_logs.items():
+                self.log(f"Loss:val/{metric_name}", metric_value, prog_bar=True, sync_dist=True)
+
+            # Log MoE expert usage variance interpretation
+            if 'expert_usage_variance' in dataloader_logs:
+                num_experts = self.cfg.decoder.get('num_experts', 8)
+                ideal_usage = 1.0 / num_experts
+                avg_expert_usage_var = dataloader_logs['expert_usage_variance']
+                logging.info(
+                    f"MoE Expert Usage (Epoch Mean) - Ideal: {ideal_usage:.4f} per expert, "
+                    f"Variance: {avg_expert_usage_var:.6f} "
+                    f"({'Balanced' if avg_expert_usage_var < 0.01 else 'Imbalanced'})"
+                )
+
+            # Log val_loss for checkpointing
+            self.log(
+                "val_loss",
+                dataloader_logs['loss'],
+                prog_bar=False,
+                sync_dist=True,
+                on_step=False,
+                on_epoch=True,
+                logger=False,
+                enable_graph=False,
+            )
+
+            self.validation_step_outputs.clear()
+            return {}
 
     def get_dataset(self, dataset_cfg, dataset_type):
         dataset = instantiate(
@@ -3641,6 +3922,119 @@ class MagpieTTSModel(ModelPT):
         )  # This will be used in worker_init_fn for instantiating tokenizer
         return dataset
 
+    def setup_multiple_validation_data(self, val_data_config: Union[DictConfig, Dict]):
+        """
+        Setup validation data with support for multiple datasets.
+        Overrides parent class to handle Lhotse dataloaders with multiple datasets.
+
+        The config structure expected:
+            validation_ds:
+                use_lhotse: true
+                # ... shared settings ...
+                datasets:
+                    - name: "val_set_0"
+                      input_cfg: [...] or path to an external YAML file
+                    - name: "val_set_1"
+                      input_cfg: [...] or path to an external YAML file
+        """
+        # Set placeholders that may be overridden
+        self._val_dl_idx: int = 0
+        self._validation_names: Optional[List[str]] = None
+        self._validation_dl: Optional[torch.utils.data.DataLoader] = None
+
+        # Preserve config
+        self._update_dataset_config(dataset_name='validation', config=val_data_config)
+
+        # Check if datasets is a path to an external YAML file
+        if 'datasets' in val_data_config and isinstance(val_data_config.datasets, (str, Path)):
+            # Load datasets from external YAML file (supports local paths and remote URLs like s3://)
+            datasets_file_path = val_data_config.datasets
+            logging.info(f"Loading validation datasets from external file: {datasets_file_path}")
+            datasets_list = OmegaConf.create(load_yaml(datasets_file_path))
+            # Replace the string path with the loaded list in config
+            with open_dict(val_data_config):
+                val_data_config.datasets = datasets_list
+
+        # Check if we have multiple validation datasets defined
+        has_multiple_datasets = False
+        if 'datasets' in val_data_config:
+            datasets_list = val_data_config.datasets
+            has_multiple_datasets = isinstance(datasets_list, (list, ListConfig)) and len(datasets_list) > 1
+
+        if has_multiple_datasets:
+            # Multiple validation datasets
+            logging.info(f"Setting up {len(val_data_config.datasets)} validation datasets")
+
+            dataloaders = []
+            dataset_names = []
+
+            # Extract shared config (everything except 'datasets' key)
+            shared_config = OmegaConf.create(val_data_config)
+            shared_config.pop('datasets', None)
+
+            for idx, dataset_config in enumerate(val_data_config.datasets):
+                # Merge shared config with dataset-specific config
+                # Dataset-specific config takes precedence
+                merged_config = OmegaConf.merge(shared_config, dataset_config)
+
+                # Get dataset name
+                if isinstance(dataset_config, (dict, DictConfig)) and 'name' in dataset_config:
+                    dataset_name = dataset_config['name']
+                else:
+                    dataset_name = f"val_set_{idx}"
+
+                dataset_names.append(dataset_name)
+
+                # Remove 'name' from config as it's not needed for dataloader setup
+                temp_config = OmegaConf.create(merged_config)
+                temp_config.pop('name', None)
+
+                # Use the existing `_setup_test_dataloader` method
+                # It handles both Lhotse and non-Lhotse cases
+                dataloader = self._setup_test_dataloader(temp_config)
+
+                dataloaders.append(dataloader)
+                logging.info(f"  - Validation dataset {idx}: '{dataset_name}'")
+
+            self._validation_dl = dataloaders
+            self._validation_names = dataset_names
+            logging.info(f"Successfully setup {len(dataloaders)} validation dataloaders")
+
+        else:
+            # Single validation dataset - use the standard setup
+            logging.info("Setting up single validation dataset")
+
+            # If datasets key exists with single entry, extract it
+            if 'datasets' in val_data_config and len(val_data_config.datasets) == 1:
+                # Merge shared config with the single dataset config
+                shared_config = OmegaConf.create(val_data_config)
+                shared_config.pop('datasets', None)
+                single_dataset_config = OmegaConf.merge(shared_config, val_data_config.datasets[0])
+                single_dataset_config.pop('name', None)  # Remove name field
+                self.setup_validation_data(single_dataset_config)
+            elif 'datasets' not in val_data_config:
+                # No datasets key - use legacy single-dataset format (backward compatibility)
+                # This handles non-lhotse configs with validation_ds.dataset structure
+                warnings.warn(
+                    "The legacy validation config format (without 'datasets' key) is deprecated "
+                    "and will be removed in a future release. Please migrate to the new format:\n"
+                    "  validation_ds:\n"
+                    "    datasets:\n"
+                    "      - name: 'val_set_0'\n"
+                    "        input_cfg: [...]\n"
+                    "See the magpietts_lhotse.yaml config for examples.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                logging.info("Using legacy validation config format (no 'datasets' key)")
+                self.setup_validation_data(val_data_config)
+            else:
+                # datasets key exists but is empty or invalid
+                raise ValueError(
+                    f"'datasets' key in `validation_ds` is empty or invalid. "
+                    f"Expected a list with at least one dataset configuration. Got: {val_data_config.datasets}"
+                )
+
     def get_lhotse_dataloader(self, dataset_cfg, mode='train') -> torch.utils.data.DataLoader:
         # TODO @xueyang: better to distinguish cfg. self.cfg is the model cfg, while cfg here is train_ds cfg. Also
         #   cfg is a classifier-free guidance.
@@ -3663,7 +4057,7 @@ class MagpieTTSModel(ModelPT):
             text_context_remapping_prob=self.text_context_remapping_prob,
         )
         data_loader = get_lhotse_dataloader_from_config(
-            config=dataset_cfg.dataset,
+            config=dataset_cfg,
             global_rank=self.global_rank,
             world_size=self.world_size,
             dataset=dataset,
@@ -3678,9 +4072,9 @@ class MagpieTTSModel(ModelPT):
             # specify target sampling rate the same as codec model's because lhotse config defaults 16_000.
             if not isinstance(dataset_cfg, DictConfig):
                 dataset_cfg = OmegaConf.create(dataset_cfg)
-            OmegaConf.set_struct(dataset_cfg.dataset, False)
-            dataset_cfg.dataset.update({"sample_rate": self.sample_rate})
-            OmegaConf.set_struct(dataset_cfg.dataset, True)
+            OmegaConf.set_struct(dataset_cfg, False)
+            dataset_cfg.update({"sample_rate": self.sample_rate})
+            OmegaConf.set_struct(dataset_cfg, True)
 
             self._train_dl = self.get_lhotse_dataloader(dataset_cfg, mode='train')
         else:
@@ -3708,9 +4102,9 @@ class MagpieTTSModel(ModelPT):
             # specify target sampling rate the same as codec model's because lhotse config defaults 16_000.
             if not isinstance(dataset_cfg, DictConfig):
                 dataset_cfg = OmegaConf.create(dataset_cfg)
-            OmegaConf.set_struct(dataset_cfg.dataset, False)
-            dataset_cfg.dataset.update({"sample_rate": self.sample_rate})
-            OmegaConf.set_struct(dataset_cfg.dataset, True)
+            OmegaConf.set_struct(dataset_cfg, False)
+            dataset_cfg.update({"sample_rate": self.sample_rate})
+            OmegaConf.set_struct(dataset_cfg, True)
             data_loader = self.get_lhotse_dataloader(dataset_cfg, mode='test')
         else:
             dataset = self.get_dataset(dataset_cfg, dataset_type='test')
