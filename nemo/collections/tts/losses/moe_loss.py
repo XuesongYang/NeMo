@@ -33,7 +33,6 @@ def compute_expert_usage(router_probs: torch.Tensor, x_mask: torch.Tensor = None
     Returns:
         torch.Tensor: Average probability of routing to each expert of shape (num_experts,)
     """
-    # TODO @xueyang: we need to re-normalize the output expert_usage to sum to 1.
     if x_mask is not None:
         # Sum over valid tokens only
         valid_probs_sum = (router_probs * x_mask.unsqueeze(-1)).sum(dim=[0, 1])  # (num_experts,)
