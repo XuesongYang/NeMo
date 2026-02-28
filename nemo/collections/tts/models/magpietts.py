@@ -297,29 +297,6 @@ class ModelInferenceParameters:
         return cls(**filtered_data)
 
 
-@dataclass
-class ValidationMediaData:
-    """Data container for media logging during validation.
-
-    This dataclass groups all the data needed for logging audio examples and
-    attention images to WandB and TensorBoard during validation.
-
-    Attributes:
-        dataset_prefix: Prefix for log keys (e.g., 'val', 'val_set_0').
-        pred_audios: List of predicted audio waveforms as numpy arrays.
-        target_audios: List of target audio waveforms as numpy arrays.
-        context_audios: List of context audio waveforms (or None if unavailable).
-        attention_data: Dict mapping attention names to lists of numpy images.
-            Keys like 'overall', 'layer_0', 'aligner_encoder_attn' map to image lists.
-    """
-
-    dataset_prefix: str
-    pred_audios: List[np.ndarray]
-    target_audios: List[np.ndarray]
-    context_audios: List[Optional[np.ndarray]]
-    attention_data: Dict[str, List[np.ndarray]]
-
-
 def worker_init_fn(worker_id):
     # For mp.set_start_method("spawn", force=True)
     # The dataset class should be picklable, so we initialize non-picklable objects here
@@ -652,6 +629,9 @@ class MagpieTTSModel(ModelPT):
                 f"Each expert has d_ffn={cfg.decoder.d_ffn}. "
                 f"Loss scales: router_load_balancing={router_load_balancing_loss_coeff}, router_z={router_z_loss_coeff}"
             )
+
+        # Lazily initialized in on_validation_epoch_end when WandB logger is available
+        self._moe_expert_usage_table: Optional[wandb.Table] = None
 
         # Define cfg parameters into self parameters
         self.prior_end_step = self.cfg.prior_end_step
@@ -1898,14 +1878,14 @@ class MagpieTTSModel(ModelPT):
             num_examples = min(max_examples, pred_audio.size(0))
             for idx in range(num_examples):
                 # Convert to numpy and trim to actual length
-                pred_audio_np = pred_audio[idx, : pred_audio_lens[idx]].float().cpu().numpy()  # TODO: do we need detach first?
-                target_audio_np = target_audio[idx, : target_audio_lens[idx]].float().cpu().numpy()  # TODO: do we need detach first?
+                pred_audio_np = pred_audio[idx, : pred_audio_lens[idx]].float().cpu().numpy()
+                target_audio_np = target_audio[idx, : target_audio_lens[idx]].float().cpu().numpy()
 
                 pred_audios.append(pred_audio_np)
                 target_audios.append(target_audio_np)
 
                 if context_audio is not None:
-                    context_audio_np = context_audio[idx, : context_audio_lens[idx]].float().cpu().numpy()  # TODO: do we need detach first?
+                    context_audio_np = context_audio[idx, : context_audio_lens[idx]].float().cpu().numpy()
                     context_audios.append(context_audio_np)
                 else:
                     context_audios.append(None)
@@ -1916,7 +1896,16 @@ class MagpieTTSModel(ModelPT):
                 'context_audios': context_audios,
             }
 
-    def _log_media_to_wandb_and_tb(self, media_data: ValidationMediaData, global_step: int) -> None:
+    def _log_media_to_wandb_and_tb(
+        self,
+        *,
+        dataset_prefix: str,
+        pred_audios: List[np.ndarray],
+        target_audios: List[np.ndarray],
+        context_audios: List[Optional[np.ndarray]],
+        attention_data: Dict[str, List[np.ndarray]],
+        global_step: int,
+    ) -> None:
         """
         Log audio examples and attention images to WandB and/or TensorBoard.
 
@@ -1924,7 +1913,11 @@ class MagpieTTSModel(ModelPT):
         It batches all WandB logs into a single call for efficiency.
 
         Args:
-            media_data: ValidationMediaData containing audio waveforms and attention images.
+            dataset_prefix: Prefix for log keys (e.g., 'val', 'val_set_0').
+            pred_audios: List of predicted audio waveforms as numpy arrays.
+            target_audios: List of target audio waveforms as numpy arrays.
+            context_audios: List of context audio waveforms (or None per entry if unavailable).
+            attention_data: Dict mapping attention names to lists of numpy images.
             global_step: Current training step for logging.
         """
         for logger in self.loggers:
@@ -1940,7 +1933,7 @@ class MagpieTTSModel(ModelPT):
 
             # Log audio examples
             for idx, (pred_audio_np, target_audio_np, context_audio_np) in enumerate(
-                zip(media_data.pred_audios, media_data.target_audios, media_data.context_audios)
+                zip(pred_audios, target_audios, context_audios)
             ):
                 if is_wandb:
                     audio_list = []
@@ -1954,36 +1947,36 @@ class MagpieTTSModel(ModelPT):
                     audio_list.append(
                         wandb.Audio(target_audio_np, sample_rate=self.output_sample_rate, caption="target")
                     )
-                    wandb_log_dict[f"Audio:{media_data.dataset_prefix}/Example_{idx}"] = audio_list
+                    wandb_log_dict[f"Audio:{dataset_prefix}/Example_{idx}"] = audio_list
 
                 if is_tb:
                     if context_audio_np is not None and context_audio_np.shape[0] > 0:
                         logger.experiment.add_audio(
-                            f'{media_data.dataset_prefix}/Example_{idx}/context',
+                            f'{dataset_prefix}/Example_{idx}/context',
                             context_audio_np,
                             global_step=global_step,
                             sample_rate=self.output_sample_rate,
                         )
                     logger.experiment.add_audio(
-                        f'{media_data.dataset_prefix}/Example_{idx}/prediction',
+                        f'{dataset_prefix}/Example_{idx}/prediction',
                         pred_audio_np,
                         global_step=global_step,
                         sample_rate=self.output_sample_rate,
                     )
                     logger.experiment.add_audio(
-                        f'{media_data.dataset_prefix}/Example_{idx}/target',
+                        f'{dataset_prefix}/Example_{idx}/target',
                         target_audio_np,
                         global_step=global_step,
                         sample_rate=self.output_sample_rate,
                     )
 
             # Log attention images
-            for attn_key, images in media_data.attention_data.items():
+            for attn_key, images in attention_data.items():
                 # Determine log prefix: 'overall' uses dataset_prefix directly, others are nested
                 if attn_key == 'overall':
-                    prefix = media_data.dataset_prefix
+                    prefix = dataset_prefix
                 else:
-                    prefix = f"{media_data.dataset_prefix}/{attn_key}"
+                    prefix = f"{dataset_prefix}/{attn_key}"
 
                 if is_wandb:
                     wandb_log_dict[f"Image:{prefix}/attention_matrix"] = [
@@ -2002,62 +1995,6 @@ class MagpieTTSModel(ModelPT):
             # Perform single wandb log call
             if is_wandb and wandb_log_dict:
                 logger.experiment.log(wandb_log_dict)
-
-    def _log_moe_expert_usage_statistics(self, moe_expert_usage_stats: Dict[str, float], global_step: int) -> None:
-        """
-        Log MoE expert usage statistics to WandB.
-        """
-        # obtain MoE expert usage statistics
-        for logger in self.loggers:
-            if not isinstance(logger, WandbLogger):
-                logging.warning("MoE Expert Usage Statistics is only available in `WandbLogger`.")
-                continue
-            
-            if not self.use_moe or not moe_expert_usage_stats:
-                logging.info("MoE Expert Usage Statistics is not availble for non-MoE models.")
-                continue
-            
-            wandb_moe_first_batch_log = {}
-
-            # per-expert usage as bar chart
-            expert_usage = moe_expert_usage_stats['expert_usage'].numpy()
-            expert_selection_freq = moe_expert_usage_stats['expert_selection_freq'].numpy()
-
-            # Create bar chart for expert usage (routing probabilities)
-            expert_names = [f"Expert_{i}" for i in range(len(expert_usage))]
-            usage_data = [[name, usage] for name, usage in zip(expert_names, expert_usage)]
-            wandb_moe_first_batch_log['val/expert_usage_distribution'] = wandb.plot.bar(
-                wandb.Table(data=usage_data, columns=["Expert", "Usage"]),
-                "Expert",
-                "Usage",
-                title="Expert Usage (Routing Probabilities)",
-            )
-
-            # Create bar chart for expert selection frequency (top-k selections)
-            selection_data = [[name, freq] for name, freq in zip(expert_names, expert_selection_freq)]
-            wandb_moe_first_batch_log['val/expert_selection_frequency'] = wandb.plot.bar(
-                wandb.Table(data=selection_data, columns=["Expert", "Frequency"]),
-                "Expert",
-                "Frequency",
-                title=f"Expert Selection Frequency (Top-{self.decoder.top_k_experts})",
-            )
-
-            # scalar metrics for numerical tracking
-            wandb_moe_first_batch_log['val/batch_expert_usage_variance'] = moe_expert_usage_stats[
-                'batch_expert_usage_variance'
-            ]
-            wandb_moe_first_batch_log['val/batch_expert_usage_max'] = moe_expert_usage_stats[
-                'batch_expert_usage_max'
-            ]
-            wandb_moe_first_batch_log['val/batch_expert_usage_min'] = moe_expert_usage_stats[
-                'batch_expert_usage_min'
-            ]
-
-            # Log individual expert usage percentages as scalars
-            for idx, usage in enumerate(expert_usage):
-                wandb_moe_first_batch_log[f'val/expert_{idx}_usage'] = float(usage)
-
-            logger.experiment.log(wandb_moe_first_batch_log)    
 
     def scale_prior(self, prior, global_step):
         if prior is None:
@@ -2823,10 +2760,7 @@ class MagpieTTSModel(ModelPT):
                 x_mask=merged_mask,
             )
 
-            # TODO @xueyang: this is batch-wise stats over layers and valid tokens. We also need similar op for
-            # epoch-wise stats in multi_validation_epoch_end. Will refactor to have a shared function for this.
             # Compute expert usage statistics (averaged across all layers, batches, and valid tokens)
-            # This shows which experts are being used most frequently
             with torch.no_grad():
                 # Use shared utility function for computing expert usage
                 expert_usage = compute_expert_usage(merged_probs, merged_mask)  # (num_experts,)
@@ -2997,8 +2931,8 @@ class MagpieTTSModel(ModelPT):
             val_output['val_moe_router_z_loss'] = moe_router_z_loss
         if moe_expert_usage_stats is not None:
             val_output['val_moe_expert_usage_stats'] = moe_expert_usage_stats
-        
-        # Prepare media data for logging (only first batch of each dataloader, rank 0 only). 
+
+        # Prepare media data for logging (only first batch of each dataloader, rank 0 only).
         if batch_idx == 0 and self.global_rank == 0:
             # Determine dataset name for logging prefix
             dataset_prefix = "val"
@@ -3067,14 +3001,13 @@ class MagpieTTSModel(ModelPT):
                         max_examples=3,
                     )
 
-            # Store media data as a typed dataclass for cleaner API
-            val_output['media_data'] = ValidationMediaData(
-                dataset_prefix=dataset_prefix,
-                pred_audios=audio_data['pred_audios'],
-                target_audios=audio_data['target_audios'],
-                context_audios=audio_data['context_audios'],
-                attention_data=attention_data,
-            )
+            val_output['media_data'] = {
+                'dataset_prefix': dataset_prefix,
+                'pred_audios': audio_data['pred_audios'],
+                'target_audios': audio_data['target_audios'],
+                'context_audios': audio_data['context_audios'],
+                'attention_data': attention_data,
+            }
 
         # Append to appropriate list based on structure
         # validation_step_outputs is initialized in ModelPT: [] for single dataloader, [[], [], ...] for multiple dataloaders.
@@ -3693,7 +3626,7 @@ class MagpieTTSModel(ModelPT):
 
     def multi_validation_epoch_end(
         self, outputs: List[Dict[str, torch.Tensor]], dataloader_idx: int = 0
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
         """
         Called for each validation dataloader at the end of validation epoch.
         Computes metrics for this specific dataloader.
@@ -3703,24 +3636,26 @@ class MagpieTTSModel(ModelPT):
             dataloader_idx: Index of the current dataloader
 
         Returns:
-            Dictionary with metrics to log
+            A tuple of (log_dict, moe_expert_data):
+                - log_dict: scalar metrics suitable for self.log()
+                - moe_expert_data: per-expert usage/selection_freq tensors of shape (num_experts,), or None
         """
 
-        def collect_required_metric(outputs, key):
+        def collect_required_metric(outputs, key, dim=None):
             values = [x[key] for x in outputs if key in x and x[key] is not None]
             if len(values) == 0:
                 raise ValueError(
                     f"No valid values found for required metric '{key}' in validation outputs "
                     f"for dataloader {dataloader_idx}. This indicates an issue with validation."
                 )
-            return torch.stack(values).mean()
+            return torch.stack(values).mean(dim=dim)
 
-        def collect_optional_metric(outputs, key):
+        def collect_optional_metric(outputs, key, dim=None):
             """Collect optional metric - returns None if not found."""
             values = [x[key] for x in outputs if key in x and x[key] is not None]
             if len(values) == 0:
                 return None
-            return torch.stack(values).mean()
+            return torch.stack(values).mean(dim=dim)
 
         if len(outputs) == 0:
             raise ValueError(
@@ -3739,11 +3674,19 @@ class MagpieTTSModel(ModelPT):
         val_moe_load_balancing_loss = collect_optional_metric(outputs, 'val_moe_load_balancing_loss')
         val_moe_router_z_loss = collect_optional_metric(outputs, 'val_moe_router_z_loss')
 
-        val_moe_expert_usage_stats = [x['val_moe_expert_usage_stats'] for x in outputs]
-        val_moe_expert_usage = collect_optional_metric(val_moe_expert_usage_stats, 'expert_usage')
-        val_moe_expert_selection_freq = collect_optional_metric(val_moe_expert_usage_stats, 'expert_selection_freq')
+        # Collect per-expert usage vectors
+        val_moe_expert_usage_stats = [
+            x.get('val_moe_expert_usage_stats') for x in outputs if x.get('val_moe_expert_usage_stats') is not None
+        ]
+        moe_expert_data = None
+        if len(val_moe_expert_usage_stats) > 0:
+            val_moe_expert_usage = collect_required_metric(val_moe_expert_usage_stats, 'expert_usage', dim=0)
+            val_moe_expert_selection_freq = collect_required_metric(val_moe_expert_usage_stats, 'expert_selection_freq', dim=0)
+            moe_expert_data = {
+                'moe_expert_usage': val_moe_expert_usage,
+                'moe_expert_selection_freq': val_moe_expert_selection_freq,
+            }
 
-        # Prepare log dict - only include metrics that were computed
         log_dict = {
             'loss': val_loss,
             'codebook_loss': val_codebook_loss,
@@ -3760,47 +3703,21 @@ class MagpieTTSModel(ModelPT):
             log_dict['moe_load_balancing_loss'] = val_moe_load_balancing_loss
         if val_moe_router_z_loss is not None:
             log_dict['moe_router_z_loss'] = val_moe_router_z_loss
-        if val_moe_expert_usage is not None:
-            val_moe_expert_usage_variance = val_moe_expert_usage.var()
-            val_moe_expert_usage_max = val_moe_expert_usage.max()
-            val_moe_expert_usage_min = val_moe_expert_usage.min()
-            log_dict['moe_expert_usage_variance'] = val_moe_expert_usage_variance
-            log_dict['moe_expert_usage_max'] = val_moe_expert_usage_max
-            log_dict['moe_expert_usage_min'] = val_moe_expert_usage_min
-            # Log interpretation hints
-            # Ideal variance for N experts: 0 (perfectly balanced)
-            # High variance (>0.01) indicates imbalanced expert usage
+        if moe_expert_data is not None:
+            val_moe_expert_usage = moe_expert_data['moe_expert_usage']
+            log_dict['moe_expert_usage_variance'] = val_moe_expert_usage.var()
+            log_dict['moe_expert_usage_max'] = val_moe_expert_usage.max()
+            log_dict['moe_expert_usage_min'] = val_moe_expert_usage.min()
+
             num_experts = self.cfg.decoder.get('num_experts', 8)
             ideal_usage = 1.0 / num_experts
             logging.info(
                 f"MoE Expert Usage (Epoch Mean) for dataloader {dataloader_idx} - Ideal: {ideal_usage:.4f} per expert, "
-                f"Variance: {val_moe_expert_usage_variance:.6f} "
-                f"({'Balanced' if val_moe_expert_usage_variance < 0.01 else 'Imbalanced'})"
-            )
-            # individual expert usage percentages as scalars
-            for idx, usage in enumerate(val_moe_expert_usage.numpy()):
-                log_dict[f'moe_expert_{idx:02d}_usage'] = float(usage)
-
-            # Create bar chart for expert usage (routing probabilities)
-            expert_names = [f"Expert_{i:02d}" for i in range(len(val_moe_expert_usage))]
-            usage_data = [[name, usage] for name, usage in zip(expert_names, val_moe_expert_usage)]
-            log_dict['moe_expert_usage_distribution'] = wandb.plot.bar(
-                wandb.Table(data=usage_data, columns=["Expert", "Usage"]),
-                "Expert",
-                "Usage",
-                title="Expert Usage (Routing Probabilities)",
+                f"Variance: {log_dict['moe_expert_usage_variance']:.6f} "
+                f"({'Balanced' if log_dict['moe_expert_usage_variance'] < 0.01 else 'Imbalanced'})"
             )
 
-            # Create bar chart for expert selection frequency (top-k selections)
-            selection_data = [[name, freq] for name, freq in zip(expert_names, val_moe_expert_selection_freq)]
-            log_dict['moe_expert_selection_frequency'] = wandb.plot.bar(
-                wandb.Table(data=selection_data, columns=["Expert", "Frequency"]),
-                "Expert",
-                "Frequency",
-                title=f"Expert Selection Frequency (Top-{self.decoder.top_k_experts})",
-            )
-                
-        return log_dict
+        return log_dict, moe_expert_data
 
     def on_validation_epoch_end(self):
         """
@@ -3829,15 +3746,19 @@ class MagpieTTSModel(ModelPT):
             if is_multi_dataloader:
                 for val_outputs in self.validation_step_outputs:
                     if len(val_outputs) > 0 and 'media_data' in val_outputs[0]:
-                        self._log_media_to_wandb_and_tb(val_outputs[0]['media_data'], global_step)
+                        self._log_media_to_wandb_and_tb(**val_outputs[0]['media_data'], global_step=global_step)
             else:
                 if len(self.validation_step_outputs) > 0 and 'media_data' in self.validation_step_outputs[0]:
-                    self._log_media_to_wandb_and_tb(self.validation_step_outputs[0]['media_data'], global_step)
+                    self._log_media_to_wandb_and_tb(
+                        **self.validation_step_outputs[0]['media_data'], global_step=global_step
+                    )
+
+        # Collect per-dataloader metrics and MoE expert data
+        # Collect per-dataloader metrics and MoE expert data, each entry is (dataset_name, moe_expert_data_dict)
+        all_moe_expert_data: List[Tuple[str, Dict[str, torch.Tensor]]] = []
 
         if is_multi_dataloader:
             # Multiple dataloaders - compute and log both per-dataloader AND averaged metrics
-
-            # Use dict to aggregate metrics across dataloaders.
             aggregated_metrics = {}
 
             # Process each dataloader
@@ -3849,16 +3770,17 @@ class MagpieTTSModel(ModelPT):
                         f"Check that the dataset is not empty and validation_step is working correctly."
                     )
 
-                # Call multi_validation_epoch_end to get metrics for this dataloader
-                dataloader_logs = self.multi_validation_epoch_end(val_outputs, dataloader_idx=dataloader_idx)
+                dataloader_logs, moe_expert_data = self.multi_validation_epoch_end(
+                    val_outputs, dataloader_idx=dataloader_idx
+                )
 
-                # Get dataset name prefix
                 dataloader_prefix = self.get_validation_dataloader_prefix(dataloader_idx)
+
+                if moe_expert_data is not None:
+                    all_moe_expert_data.append((dataloader_prefix, moe_expert_data))
 
                 # Log per-dataloader metrics and collect for averaging
                 for metric_name, metric_value in dataloader_logs.items():
-                    # TODO @xueyang: expert_usage_variance_epoch_mean could be also a key in dataloader_logs, and need
-                    # to decide which other wandb pannel to log it to.
                     self.log(f"Loss:{dataloader_prefix}/{metric_name}", metric_value, prog_bar=False, sync_dist=True)
                     aggregated_metrics.setdefault(metric_name, []).append(metric_value)
 
@@ -3870,14 +3792,14 @@ class MagpieTTSModel(ModelPT):
                 if required_metric not in aggregated_metrics or len(aggregated_metrics[required_metric]) == 0:
                     raise ValueError(f"No {required_metric} collected from any dataloader.")
 
-            # Compute and log averaged metrics overall all dataloaders
+            # Compute and log averaged metrics across all dataloaders
             for metric_name, metric_values in aggregated_metrics.items():
                 if "loss" in metric_name:
                     avg_value = torch.stack(metric_values).mean()
                     self.log(f"Loss:val_avg/{metric_name}", avg_value, prog_bar=True, sync_dist=True)
                     if metric_name == 'loss':
                         avg_val_loss = avg_value
-            
+
             # Log avg val_loss for checkpointing (without logger to avoid duplication)
             self.log(
                 "val_loss",
@@ -3890,16 +3812,14 @@ class MagpieTTSModel(ModelPT):
                 enable_graph=False,
             )
 
-            return {}
-
         else:
-            # Single dataloader - reuse multi_validation_epoch_end logic
-            dataloader_logs = self.multi_validation_epoch_end(self.validation_step_outputs, dataloader_idx=0)
+            # Single dataloader
+            dataloader_logs, moe_expert_data = self.multi_validation_epoch_end(self.validation_step_outputs, dataloader_idx=0)
 
-            # Log all metrics with "Loss:val/" prefix
+            if moe_expert_data is not None:
+                all_moe_expert_data.append(("val", moe_expert_data))
+
             for metric_name, metric_value in dataloader_logs.items():
-                # TODO @xueyang: expert_usage_variance_epoch_mean could be also a key in dataloader_logs, and need
-                # to decide which other wandb pannel to log it to.
                 self.log(f"Loss:val/{metric_name}", metric_value, prog_bar=True, sync_dist=True)
 
             # Log val_loss for checkpointing
@@ -3915,7 +3835,36 @@ class MagpieTTSModel(ModelPT):
             )
 
             self.validation_step_outputs.clear()
-            return {}
+
+        # Log MoE expert usage to an incremental wandb.Table so usage history is trackable
+        # as curves in the WandB UI. Each row: (global_step, dataset, expert, usage, selection_freq).
+        if all_moe_expert_data and self.global_rank == 0:
+            global_step = int(self.global_step)
+            for logger in self.loggers:
+                if not isinstance(logger, WandbLogger):
+                    continue
+
+                if self._moe_expert_usage_table is None:
+                    self._moe_expert_usage_table = wandb.Table(
+                        columns=["global_step", "dataset", "expert", "usage", "selection_freq"],
+                        log_mode="INCREMENTAL",
+                    )
+
+                for dataset_name, moe_data in all_moe_expert_data:
+                    expert_usage = moe_data['moe_expert_usage']
+                    expert_sel_freq = moe_data['moe_expert_selection_freq']
+                    for eidx in range(len(expert_usage)):
+                        self._moe_expert_usage_table.add_data(
+                            global_step,
+                            dataset_name,
+                            f"Expert_{eidx:02d}",
+                            float(expert_usage[eidx]),
+                            float(expert_sel_freq[eidx]),
+                        )
+
+                logger.experiment.log({"MoE/expert_usage_history": self._moe_expert_usage_table})
+
+        return {}
 
     def get_dataset(self, dataset_cfg, dataset_type):
         dataset = instantiate(
