@@ -630,8 +630,9 @@ class MagpieTTSModel(ModelPT):
                 f"Loss scales: router_load_balancing={router_load_balancing_loss_coeff}, router_z={router_z_loss_coeff}"
             )
 
-        # Lazily initialized in on_validation_epoch_end when WandB logger is available
-        self._moe_expert_usage_table: Optional[wandb.Table] = None
+        # Lazily initialized when WandB logger is available
+        self._moe_expert_usage_train_table: Optional[wandb.Table] = None
+        self._moe_expert_usage_val_table: Optional[wandb.Table] = None
 
         # Define cfg parameters into self parameters
         self.prior_end_step = self.cfg.prior_end_step
@@ -2788,6 +2789,7 @@ class MagpieTTSModel(ModelPT):
                     'batch_expert_usage_variance': batch_expert_usage_variance.item(),
                     'batch_expert_usage_max': batch_expert_usage_max.item(),
                     'batch_expert_usage_min': batch_expert_usage_min.item(),
+                    'ideal_usage': 1.0 / num_experts,
                 }
 
             # Add MoE loss to total loss (only in training mode)
@@ -2834,13 +2836,46 @@ class MagpieTTSModel(ModelPT):
         if local_transformer_loss is not None:
             self.log('Loss:train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
 
-        # Log MoE losses if MoE is enabled
+        # Log MoE losses and expert usage if MoE is enabled
         moe_load_balancing_loss = batch_output.get('moe_load_balancing_loss', None)
         moe_router_z_loss = batch_output.get('moe_router_z_loss', None)
+        moe_expert_usage_stats = batch_output.get('moe_expert_usage_stats', None)
         if moe_load_balancing_loss is not None:
-            self.log('train/moe_load_balancing_loss', moe_load_balancing_loss, prog_bar=True, sync_dist=True)
+            self.log('Loss:train/moe_load_balancing_loss', moe_load_balancing_loss, prog_bar=True, sync_dist=True)
         if moe_router_z_loss is not None:
-            self.log('train/moe_router_z_loss', moe_router_z_loss, prog_bar=True, sync_dist=True)
+            self.log('Loss:train/moe_router_z_loss', moe_router_z_loss, prog_bar=True, sync_dist=True)
+        if moe_expert_usage_stats is not None:
+            self.log('Loss:train/moe_expert_usage_variance', moe_expert_usage_stats['batch_expert_usage_variance'], sync_dist=True)
+            self.log('Loss:train/moe_expert_usage_max', moe_expert_usage_stats['batch_expert_usage_max'], sync_dist=True)
+            self.log('Loss:train/moe_expert_usage_min', moe_expert_usage_stats['batch_expert_usage_min'], sync_dist=True)
+
+            # Log per-expert usage to incremental table at the same frequency as other metrics.
+            # Unlike self.log() which is auto-throttled by Lightning's log_every_n_steps,
+            # logger.experiment.log() is a raw WandB API call that fires every invocation,
+            # so we manually gate on log_every_n_steps here.
+            if self.global_rank == 0 and self.global_step % self.trainer.log_every_n_steps == 0:
+                for logger in self.loggers:
+                    if not isinstance(logger, WandbLogger):
+                        continue
+                    if self._moe_expert_usage_train_table is None:
+                        self._moe_expert_usage_train_table = wandb.Table(
+                            columns=["global_step", "expert", "usage", "selection_freq"],
+                            log_mode="INCREMENTAL",
+                        )
+                    expert_usage = moe_expert_usage_stats['expert_usage']
+                    expert_sel_freq = moe_expert_usage_stats['expert_selection_freq']
+                    ideal = moe_expert_usage_stats['ideal_usage']
+                    self._moe_expert_usage_train_table.add_data(
+                        int(self.global_step), "Ideal", ideal, ideal,
+                    )
+                    for eidx in range(len(expert_usage)):
+                        self._moe_expert_usage_train_table.add_data(
+                            int(self.global_step),
+                            f"Expert_{eidx:02d}",
+                            float(expert_usage[eidx]),
+                            float(expert_sel_freq[eidx]),
+                        )
+                    logger.experiment.log({"MoE/train_expert_usage_history": self._moe_expert_usage_train_table})
 
         # Log batch info
         batch_size, text_token_max_len = batch["text"].shape
@@ -3682,9 +3717,11 @@ class MagpieTTSModel(ModelPT):
         if len(val_moe_expert_usage_stats) > 0:
             val_moe_expert_usage = collect_required_metric(val_moe_expert_usage_stats, 'expert_usage', dim=0)
             val_moe_expert_selection_freq = collect_required_metric(val_moe_expert_usage_stats, 'expert_selection_freq', dim=0)
+            ideal_usage = val_moe_expert_usage_stats[0]['ideal_usage']
             moe_expert_data = {
                 'moe_expert_usage': val_moe_expert_usage,
                 'moe_expert_selection_freq': val_moe_expert_selection_freq,
+                'ideal_usage': ideal_usage,
             }
 
         log_dict = {
@@ -3709,10 +3746,8 @@ class MagpieTTSModel(ModelPT):
             log_dict['moe_expert_usage_max'] = val_moe_expert_usage.max()
             log_dict['moe_expert_usage_min'] = val_moe_expert_usage.min()
 
-            num_experts = self.cfg.decoder.get('num_experts', 8)
-            ideal_usage = 1.0 / num_experts
             logging.info(
-                f"MoE Expert Usage (Epoch Mean) for dataloader {dataloader_idx} - Ideal: {ideal_usage:.4f} per expert, "
+                f"MoE Expert Usage (Epoch Mean) for dataloader {dataloader_idx} - Ideal: {moe_expert_data['ideal_usage']:.4f} per expert, "
                 f"Variance: {log_dict['moe_expert_usage_variance']:.6f} "
                 f"({'Balanced' if log_dict['moe_expert_usage_variance'] < 0.01 else 'Imbalanced'})"
             )
@@ -3753,8 +3788,7 @@ class MagpieTTSModel(ModelPT):
                         **self.validation_step_outputs[0]['media_data'], global_step=global_step
                     )
 
-        # Collect per-dataloader metrics and MoE expert data
-        # Collect per-dataloader metrics and MoE expert data, each entry is (dataset_name, moe_expert_data_dict)
+        # Collect per-dataloader metrics and MoE expert data. Each entry is (dataset_name, moe_expert_data_dict).
         all_moe_expert_data: List[Tuple[str, Dict[str, torch.Tensor]]] = []
 
         if is_multi_dataloader:
@@ -3844,8 +3878,8 @@ class MagpieTTSModel(ModelPT):
                 if not isinstance(logger, WandbLogger):
                     continue
 
-                if self._moe_expert_usage_table is None:
-                    self._moe_expert_usage_table = wandb.Table(
+                if self._moe_expert_usage_val_table is None:
+                    self._moe_expert_usage_val_table = wandb.Table(
                         columns=["global_step", "dataset", "expert", "usage", "selection_freq"],
                         log_mode="INCREMENTAL",
                     )
@@ -3853,8 +3887,12 @@ class MagpieTTSModel(ModelPT):
                 for dataset_name, moe_data in all_moe_expert_data:
                     expert_usage = moe_data['moe_expert_usage']
                     expert_sel_freq = moe_data['moe_expert_selection_freq']
+                    ideal = moe_data['ideal_usage']
+                    self._moe_expert_usage_val_table.add_data(
+                        global_step, dataset_name, "Ideal", ideal, ideal,
+                    )
                     for eidx in range(len(expert_usage)):
-                        self._moe_expert_usage_table.add_data(
+                        self._moe_expert_usage_val_table.add_data(
                             global_step,
                             dataset_name,
                             f"Expert_{eidx:02d}",
@@ -3862,7 +3900,7 @@ class MagpieTTSModel(ModelPT):
                             float(expert_sel_freq[eidx]),
                         )
 
-                logger.experiment.log({"MoE/expert_usage_history": self._moe_expert_usage_table})
+                logger.experiment.log({"MoE/val_expert_usage_history": self._moe_expert_usage_val_table})
 
         return {}
 
