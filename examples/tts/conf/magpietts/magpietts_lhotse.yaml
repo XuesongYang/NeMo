@@ -73,7 +73,7 @@ model:
     min_duration: 0.2
     min_context_speaker_similarity: 0.6
     max_cer: 0.03
-    batch_duration : ???  # in seconds. Adjust based on your GPU memory.
+    batch_duration: ???  # in seconds. Adjust based on your GPU memory.
     quadratic_duration: ${quadratic_duration}
     use_bucketing: true
     num_buckets: 20
