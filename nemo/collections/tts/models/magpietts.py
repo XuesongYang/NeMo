@@ -16,7 +16,7 @@ import json
 import os
 import random
 import time
-import warnings
+
 from dataclasses import dataclass, field, fields
 from functools import partial
 from pathlib import Path
@@ -629,10 +629,9 @@ class MagpieTTSModel(ModelPT):
                 f"Each expert has d_ffn={cfg.decoder.d_ffn}. "
                 f"Loss scales: router_load_balancing={router_load_balancing_loss_coeff}, router_z={router_z_loss_coeff}"
             )
-
-        # Lazily initialized when WandB logger is available
-        self._moe_expert_usage_train_table: Optional[wandb.Table] = None
-        self._moe_expert_usage_val_table: Optional[wandb.Table] = None
+            # Lazily initialized when WandB logger is available
+            self._moe_expert_usage_train_table: Optional[wandb.Table] = None
+            self._moe_expert_usage_val_table: Optional[wandb.Table] = None
 
         # Define cfg parameters into self parameters
         self.prior_end_step = self.cfg.prior_end_step
@@ -816,6 +815,24 @@ class MagpieTTSModel(ModelPT):
         if not self.has_baked_context_embedding:
             return 0
         return self.baked_context_embedding.num_embeddings
+
+    @property
+    def validation_step_outputs(self):
+        """Always use list-of-lists structure for uniform single/multi-dataloader handling.
+
+        Overrides ModelPT which uses a flat list for single dataloader and list-of-lists
+        for multiple dataloaders. This override always returns list-of-lists so that
+        validation_step, on_validation_epoch_end, etc. don't need conditional branching.
+        """
+        if self._validation_step_outputs is not None:
+            return self._validation_step_outputs
+        num_dl = len(self._validation_dl) if self._validation_dl is not None else 1
+        self._validation_step_outputs = [[] for _ in range(num_dl)]
+        return self._validation_step_outputs
+
+    @validation_step_outputs.setter
+    def validation_step_outputs(self, value):
+        self._validation_step_outputs = value
 
     def _normalize_speaker_indices(
         self,
@@ -2969,10 +2986,7 @@ class MagpieTTSModel(ModelPT):
 
         # Prepare media data for logging (only first batch of each dataloader, rank 0 only).
         if batch_idx == 0 and self.global_rank == 0:
-            # Determine dataset name for logging prefix
-            dataset_prefix = "val"
-            if self._validation_names is not None:  # multi-dataloader case
-                dataset_prefix = self._validation_names[dataloader_idx]
+            dataset_prefix = self.get_validation_dataloader_prefix(dataloader_idx)
 
             # Prepare audio examples (decode via vocoder, convert to numpy)
             audio_data = self._prepare_audio_examples(
@@ -3044,14 +3058,7 @@ class MagpieTTSModel(ModelPT):
                 'attention_data': attention_data,
             }
 
-        # Append to appropriate list based on structure
-        # validation_step_outputs is initialized in ModelPT: [] for single dataloader, [[], [], ...] for multiple dataloaders.
-        if len(self.validation_step_outputs) > 0 and isinstance(self.validation_step_outputs[0], list):
-            # Multiple dataloaders: list of lists
-            self.validation_step_outputs[dataloader_idx].append(val_output)
-        else:
-            # Single dataloader: flat list
-            self.validation_step_outputs.append(val_output)
+        self.validation_step_outputs[dataloader_idx].append(val_output)
 
         return val_output
 
@@ -3756,119 +3763,78 @@ class MagpieTTSModel(ModelPT):
 
     def on_validation_epoch_end(self):
         """
-        Computes and logs averaged metrics across all validation dataloaders.
+        Computes and logs metrics across all validation dataloaders.
 
         This method:
         1. Computes per-dataloader metrics from validation outputs.
-        2. Computes averages across all dataloaders.
-        3. Logs both per-dataloader and averaged metrics:
-           - Per-dataloader: "Loss:<dataset_name>/loss", "Loss:<dataset_name>/codebook_loss", etc.
-           - Averaged (multi-dataloader): "Loss:val_avg/loss", "Loss:val_avg/codebook_loss", etc.
-           - Single dataloader: "Loss:val/loss", "Loss:val/codebook_loss", etc.
-        4. Uses averaged val_loss for checkpointing (logged without logger prefix for ModelCheckpoint).
+        2. Logs per-dataloader metrics as "Loss:<dataset_name>/<metric>".
+        3. For multiple dataloaders, also logs averaged metrics as "Loss:val_avg/<metric>".
+        4. Uses (averaged if multi-DL, direct if single-DL) val_loss for checkpointing.
         """
-        # Check where we don't provide data loaders.
-        if self.validation_step_outputs is None or len(self.validation_step_outputs) == 0:
+        if len(self.validation_step_outputs) == 0:
             return {}
 
-        # Determine if we have multiple dataloaders
-        is_multi_dataloader = isinstance(self.validation_step_outputs[0], list)
+        num_dataloaders = len(self.validation_step_outputs)
 
         # Log media (audio + attention images) from first batch of each dataloader.
-        # Media data was prepared in validation_step; here we just create wandb/tb objects and log.
         if self.global_rank == 0:
             global_step = int(self.global_step)
-            if is_multi_dataloader:
-                for val_outputs in self.validation_step_outputs:
-                    if len(val_outputs) > 0 and 'media_data' in val_outputs[0]:
-                        self._log_media_to_wandb_and_tb(**val_outputs[0]['media_data'], global_step=global_step)
-            else:
-                if len(self.validation_step_outputs) > 0 and 'media_data' in self.validation_step_outputs[0]:
-                    self._log_media_to_wandb_and_tb(
-                        **self.validation_step_outputs[0]['media_data'], global_step=global_step
-                    )
+            for val_outputs in self.validation_step_outputs:
+                if len(val_outputs) > 0 and 'media_data' in val_outputs[0]:
+                    self._log_media_to_wandb_and_tb(**val_outputs[0]['media_data'], global_step=global_step)
 
-        # Collect per-dataloader metrics and MoE expert data. Each entry is (dataset_name, moe_expert_data_dict).
+        # Process each dataloader. Each entry is (dataset_name, moe_expert_data_dict)
         all_moe_expert_data: List[Tuple[str, Dict[str, torch.Tensor]]] = []
+        aggregated_metrics: Dict[str, List[torch.Tensor]] = {}
 
-        if is_multi_dataloader:
-            # Multiple dataloaders - compute and log both per-dataloader AND averaged metrics
-            aggregated_metrics = {}
-
-            # Process each dataloader
-            for dataloader_idx, val_outputs in enumerate(self.validation_step_outputs):
-                if len(val_outputs) == 0:
-                    raise ValueError(
-                        f"Validation dataloader {dataloader_idx} produced no outputs. "
-                        f"This indicates an issue with the dataloader or validation data. "
-                        f"Check that the dataset is not empty and validation_step is working correctly."
-                    )
-
-                dataloader_logs, moe_expert_data = self.multi_validation_epoch_end(
-                    val_outputs, dataloader_idx=dataloader_idx
+        for dataloader_idx, val_outputs in enumerate(self.validation_step_outputs):
+            if len(val_outputs) == 0:
+                raise ValueError(
+                    f"Validation dataloader {dataloader_idx} produced no outputs. "
+                    f"Check that the dataset is not empty and validation_step is working correctly."
                 )
 
-                dataloader_prefix = self.get_validation_dataloader_prefix(dataloader_idx)
+            dataloader_logs, moe_expert_data = self.multi_validation_epoch_end(
+                val_outputs, dataloader_idx=dataloader_idx
+            )
 
-                if moe_expert_data is not None:
-                    all_moe_expert_data.append((dataloader_prefix, moe_expert_data))
+            dataloader_prefix = self.get_validation_dataloader_prefix(dataloader_idx)
 
-                # Log per-dataloader metrics and collect for averaging
-                for metric_name, metric_value in dataloader_logs.items():
-                    self.log(f"Loss:{dataloader_prefix}/{metric_name}", metric_value, prog_bar=False, sync_dist=True)
-                    aggregated_metrics.setdefault(metric_name, []).append(metric_value)
+            if moe_expert_data is not None:
+                all_moe_expert_data.append((dataloader_prefix, moe_expert_data))
 
-                # Clear outputs for this dataloader
-                self.validation_step_outputs[dataloader_idx].clear()
+            for metric_name, metric_value in dataloader_logs.items():
+                self.log(f"Loss:{dataloader_prefix}/{metric_name}", metric_value, prog_bar=(num_dataloaders == 1), sync_dist=True)
+                aggregated_metrics.setdefault(metric_name, []).append(metric_value)
 
-            # Validate required metrics were collected
-            for required_metric in ['loss', 'codebook_loss']:
-                if required_metric not in aggregated_metrics or len(aggregated_metrics[required_metric]) == 0:
-                    raise ValueError(f"No {required_metric} collected from any dataloader.")
+        for idx in range(num_dataloaders):
+            self.validation_step_outputs[idx].clear()
 
-            # Compute and log averaged metrics across all dataloaders
+        # Validate required metrics were collected
+        for required_metric in ['loss', 'codebook_loss']:
+            if required_metric not in aggregated_metrics or len(aggregated_metrics[required_metric]) == 0:
+                raise ValueError(f"No {required_metric} collected from any dataloader.")
+
+        # Determine checkpoint loss: averaged across dataloaders (multi-DL) or direct (single-DL).
+        checkpoint_loss = aggregated_metrics['loss'][0]
+        if num_dataloaders > 1:
             for metric_name, metric_values in aggregated_metrics.items():
                 if "loss" in metric_name:
                     avg_value = torch.stack(metric_values).mean()
                     self.log(f"Loss:val_avg/{metric_name}", avg_value, prog_bar=True, sync_dist=True)
                     if metric_name == 'loss':
-                        avg_val_loss = avg_value
+                        checkpoint_loss = avg_value
 
-            # Log avg val_loss for checkpointing (without logger to avoid duplication)
-            self.log(
-                "val_loss",
-                avg_val_loss,
-                prog_bar=False,
-                sync_dist=True,
-                on_step=False,
-                on_epoch=True,
-                logger=False,  # Don't log to wandb (already logged as "Loss:val_avg/loss" above)
-                enable_graph=False,
-            )
-
-        else:
-            # Single dataloader
-            dataloader_logs, moe_expert_data = self.multi_validation_epoch_end(self.validation_step_outputs, dataloader_idx=0)
-
-            if moe_expert_data is not None:
-                all_moe_expert_data.append(("val", moe_expert_data))
-
-            for metric_name, metric_value in dataloader_logs.items():
-                self.log(f"Loss:val/{metric_name}", metric_value, prog_bar=True, sync_dist=True)
-
-            # Log val_loss for checkpointing
-            self.log(
-                "val_loss",
-                dataloader_logs['loss'],
-                prog_bar=False,
-                sync_dist=True,
-                on_step=False,
-                on_epoch=True,
-                logger=False,
-                enable_graph=False,
-            )
-
-            self.validation_step_outputs.clear()
+        self.log(
+            "val_loss",
+            checkpoint_loss,
+            prog_bar=False,
+            sync_dist=True,
+            on_step=False,
+            on_epoch=True,
+            logger=False,
+            enable_graph=False,
+        )
 
         # Log MoE expert usage to an incremental wandb.Table so usage history is trackable
         # as curves in the WandB UI. Each row: (global_step, dataset, expert, usage, selection_freq).
@@ -3962,85 +3928,54 @@ class MagpieTTSModel(ModelPT):
             with open_dict(val_data_config):
                 val_data_config.datasets = datasets_list
 
-        # Check if we have multiple validation datasets defined
-        has_multiple_datasets = False
-        if 'datasets' in val_data_config:
-            datasets_list = val_data_config.datasets
-            has_multiple_datasets = isinstance(datasets_list, (list, ListConfig)) and len(datasets_list) > 1
+        if 'datasets' not in val_data_config:
+            raise ValueError(
+                "validation_ds config must contain a 'datasets' key with a list of dataset configurations. "
+                "Example:\n"
+                "  validation_ds:\n"
+                "    datasets:\n"
+                "      - name: 'val_set_0'\n"
+                "        input_cfg: [...]\n"
+                "See the magpietts_lhotse.yaml config for examples."
+            )
 
-        if has_multiple_datasets:
-            # Multiple validation datasets
-            logging.info(f"Setting up {len(val_data_config.datasets)} validation datasets")
+        datasets_list = val_data_config.datasets
+        if not isinstance(datasets_list, (list, ListConfig)) or len(datasets_list) == 0:
+            raise ValueError(
+                f"'datasets' key in `validation_ds` is empty or invalid. "
+                f"Expected a list with at least one dataset configuration. Got: {datasets_list}"
+            )
 
-            dataloaders = []
-            dataset_names = []
+        logging.info(f"Setting up {len(datasets_list)} validation dataset(s)")
 
-            # Extract shared config (everything except 'datasets' key)
-            shared_config = OmegaConf.create(val_data_config)
-            shared_config.pop('datasets', None)
+        dataloaders = []
+        dataset_names = []
 
-            for idx, dataset_config in enumerate(val_data_config.datasets):
-                # Merge shared config with dataset-specific config
-                # Dataset-specific config takes precedence
-                merged_config = OmegaConf.merge(shared_config, dataset_config)
+        # Extract shared config (everything except 'datasets' key)
+        shared_config = OmegaConf.create(val_data_config)
+        shared_config.pop('datasets', None)
 
-                # Get dataset name
-                if isinstance(dataset_config, (dict, DictConfig)) and 'name' in dataset_config:
-                    dataset_name = dataset_config['name']
-                else:
-                    dataset_name = f"val_set_{idx}"
+        for idx, dataset_config in enumerate(datasets_list):
+            merged_config = OmegaConf.merge(shared_config, dataset_config)
 
-                dataset_names.append(dataset_name)
-
-                # Remove 'name' from config as it's not needed for dataloader setup
-                temp_config = OmegaConf.create(merged_config)
-                temp_config.pop('name', None)
-
-                # Use the existing `_setup_test_dataloader` method
-                # It handles both Lhotse and non-Lhotse cases
-                dataloader = self._setup_test_dataloader(temp_config)
-
-                dataloaders.append(dataloader)
-                logging.info(f"  - Validation dataset {idx}: '{dataset_name}'")
-
-            self._validation_dl = dataloaders
-            self._validation_names = dataset_names
-            logging.info(f"Successfully setup {len(dataloaders)} validation dataloaders")
-
-        else:
-            # Single validation dataset - use the standard setup
-            logging.info("Setting up single validation dataset")
-
-            # If datasets key exists with single entry, extract it
-            if 'datasets' in val_data_config and len(val_data_config.datasets) == 1:
-                # Merge shared config with the single dataset config
-                shared_config = OmegaConf.create(val_data_config)
-                shared_config.pop('datasets', None)
-                single_dataset_config = OmegaConf.merge(shared_config, val_data_config.datasets[0])
-                single_dataset_config.pop('name', None)  # Remove name field
-                self.setup_validation_data(single_dataset_config)
-            elif 'datasets' not in val_data_config:
-                # No datasets key - use legacy single-dataset format (backward compatibility)
-                # This handles non-lhotse configs with validation_ds.dataset structure
-                warnings.warn(
-                    "The legacy validation config format (without 'datasets' key) is deprecated "
-                    "and will be removed in a future release. Please migrate to the new format:\n"
-                    "  validation_ds:\n"
-                    "    datasets:\n"
-                    "      - name: 'val_set_0'\n"
-                    "        input_cfg: [...]\n"
-                    "See the magpietts_lhotse.yaml config for examples.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-                logging.info("Using legacy validation config format (no 'datasets' key)")
-                self.setup_validation_data(val_data_config)
+            if isinstance(dataset_config, (dict, DictConfig)) and 'name' in dataset_config:
+                dataset_name = dataset_config['name']
             else:
-                # datasets key exists but is empty or invalid
-                raise ValueError(
-                    f"'datasets' key in `validation_ds` is empty or invalid. "
-                    f"Expected a list with at least one dataset configuration. Got: {val_data_config.datasets}"
-                )
+                dataset_name = f"val_set_{idx}"
+
+            dataset_names.append(dataset_name)
+
+            # Remove 'name' field from config as it's not needed for dataloader setup
+            temp_config = OmegaConf.create(merged_config)
+            temp_config.pop('name', None)
+
+            dataloader = self._setup_test_dataloader(temp_config)
+            dataloaders.append(dataloader)
+            logging.info(f"  - Validation dataset {idx}: '{dataset_name}'")
+
+        self._validation_names = dataset_names
+        self._validation_dl = dataloaders
+        logging.info(f"Successfully setup {len(dataloaders)} validation dataloader(s)")
 
     def get_lhotse_dataloader(self, dataset_cfg, mode='train') -> torch.utils.data.DataLoader:
         # TODO @xueyang: better to distinguish cfg. self.cfg is the model cfg, while cfg here is train_ds cfg. Also
@@ -4131,7 +4066,9 @@ class MagpieTTSModel(ModelPT):
         return data_loader
 
     def setup_validation_data(self, dataset_cfg):
-        self._validation_dl = self._setup_test_dataloader(dataset_cfg)
+        """Required by ModelPT (abstract). Use setup_multiple_validation_data instead."""
+        self._validation_names = ['val_set_0']
+        self._validation_dl = [self._setup_test_dataloader(dataset_cfg)]
 
     def setup_test_data(self, dataset_cfg):
         self._test_dl = self._setup_test_dataloader(dataset_cfg)
