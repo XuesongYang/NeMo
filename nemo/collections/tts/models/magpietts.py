@@ -2801,11 +2801,11 @@ class MagpieTTSModel(ModelPT):
                 batch_expert_usage_min = expert_usage.min()
 
                 moe_expert_usage_stats = {
-                    'expert_usage': expert_usage.cpu(),  # (num_experts,)
-                    'expert_selection_freq': expert_selection_freq.cpu(),  # (num_experts,)
-                    'batch_expert_usage_variance': batch_expert_usage_variance.item(),
-                    'batch_expert_usage_max': batch_expert_usage_max.item(),
-                    'batch_expert_usage_min': batch_expert_usage_min.item(),
+                    'expert_usage': expert_usage.detach(),  # (num_experts,)
+                    'expert_selection_freq': expert_selection_freq.detach(),  # (num_experts,)
+                    'batch_expert_usage_variance': batch_expert_usage_variance.detach(),
+                    'batch_expert_usage_max': batch_expert_usage_max.detach(),
+                    'batch_expert_usage_min': batch_expert_usage_min.detach(),
                     'ideal_usage': 1.0 / num_experts,
                 }
 
