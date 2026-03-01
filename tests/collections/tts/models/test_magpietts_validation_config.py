@@ -15,16 +15,12 @@
 """
 Unit tests for MagpieTTSModel.setup_multiple_validation_data method.
 
-Tests both the new config style (with 'datasets' key) and the legacy style
-(without 'datasets' key) for backward compatibility.
-
 Config styles tested:
-1. New style (lhotse): validation_ds.datasets[].input_cfg with type: lhotse_shar
-2. Legacy lhotse style: validation_ds.dataset.input_cfg with type: lhotse_shar (deprecated)
-3. Legacy non-lhotse style: validation_ds.dataset._target_: MagpieTTSDataset (deprecated)
+1. Single dataset: validation_ds.datasets with one entry
+2. Multiple datasets: validation_ds.datasets with multiple entries
+3. Error cases: missing or empty 'datasets' key
 """
 
-import warnings
 from unittest.mock import MagicMock
 
 import pytest
@@ -41,14 +37,13 @@ class TestSetupMultipleValidationData:
         """Create a mock MagpieTTSModel instance with required methods mocked."""
         model = MagicMock(spec=MagpieTTSModel)
         model._update_dataset_config = MagicMock()
-        model.setup_validation_data = MagicMock()
         model._setup_test_dataloader = MagicMock(return_value=MagicMock())
         return model
 
     @pytest.mark.run_only_on('CPU')
     @pytest.mark.unit
-    def test_new_style_lhotse_single_dataset(self, mock_model):
-        """New lhotse config with single dataset: no warning, merges shared config with dataset overrides."""
+    def test_single_dataset_merges_shared_config(self, mock_model):
+        """Single dataset entry merges shared config, strips 'name', and stores dataloader as a list."""
         config = OmegaConf.create(
             {
                 'use_lhotse': True,
@@ -56,7 +51,7 @@ class TestSetupMultipleValidationData:
                 'num_workers': 2,  # Shared config
                 'datasets': [
                     {
-                        'name': 'val_set_0',
+                        'name': 'custom_single_val',
                         'batch_duration': 50,  # Override shared
                         'input_cfg': [{'type': 'lhotse_shar', 'shar_path': '/path/to/data'}],
                     }
@@ -64,22 +59,22 @@ class TestSetupMultipleValidationData:
             }
         )
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            MagpieTTSModel.setup_multiple_validation_data(mock_model, config)
-            deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            assert len(deprecation_warnings) == 0, "New config style should not emit deprecation warning"
+        MagpieTTSModel.setup_multiple_validation_data(mock_model, config)
 
-        # Should call setup_validation_data with merged config
-        mock_model.setup_validation_data.assert_called_once()
-        passed_config = mock_model.setup_validation_data.call_args[0][0]
+        # Single dataset goes through the same unified loop as multi-dataset
+        mock_model._setup_test_dataloader.assert_called_once()
+        passed_config = mock_model._setup_test_dataloader.call_args[0][0]
         assert passed_config.batch_duration == 50  # Dataset override wins
         assert passed_config.num_workers == 2  # Shared config preserved
+        assert 'name' not in passed_config  # 'name' stripped before dataloader setup
+        assert isinstance(mock_model._validation_dl, list)
+        assert len(mock_model._validation_dl) == 1
+        assert mock_model._validation_names == ['custom_single_val']
 
     @pytest.mark.run_only_on('CPU')
     @pytest.mark.unit
-    def test_new_style_lhotse_multiple_datasets(self, mock_model):
-        """New lhotse config with multiple datasets: creates multiple dataloaders, assigns default names if missing."""
+    def test_multiple_datasets_with_default_and_custom_names(self, mock_model):
+        """Multiple dataset entries create separate dataloaders and assign default names when unspecified."""
         config = OmegaConf.create(
             {
                 'use_lhotse': True,
@@ -91,11 +86,7 @@ class TestSetupMultipleValidationData:
             }
         )
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            MagpieTTSModel.setup_multiple_validation_data(mock_model, config)
-            deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            assert len(deprecation_warnings) == 0, "New config style should not emit deprecation warning"
+        MagpieTTSModel.setup_multiple_validation_data(mock_model, config)
 
         # Should call _setup_test_dataloader twice (once per dataset)
         assert mock_model._setup_test_dataloader.call_count == 2
@@ -104,72 +95,23 @@ class TestSetupMultipleValidationData:
         # First dataset gets default name, second uses explicit name
         assert mock_model._validation_names == ['val_set_0', 'custom_name']
 
-    # ==================== Legacy Style Tests (deprecated, with 'dataset' key) ====================
-
-    @pytest.mark.run_only_on('CPU')
-    @pytest.mark.unit
-    def test_legacy_lhotse_style_deprecated_but_functional(self, mock_model):
-        """Legacy lhotse config (dataset.input_cfg with lhotse_shar) emits warning but still works."""
-        config = OmegaConf.create(
-            {
-                'use_lhotse': True,
-                'volume_norm': True,
-                'dataset': {
-                    'batch_duration': 100,
-                    'input_cfg': [{'type': 'lhotse_shar', 'shar_path': '/path/to/data'}],
-                },
-            }
-        )
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            MagpieTTSModel.setup_multiple_validation_data(mock_model, config)
-            deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            assert len(deprecation_warnings) == 1, "Legacy lhotse config should emit deprecation warning"
-            assert "deprecated" in str(deprecation_warnings[0].message).lower()
-            assert "datasets" in str(deprecation_warnings[0].message).lower()
-
-        # Should still call setup_validation_data with original config for backward compatibility
-        mock_model.setup_validation_data.assert_called_once_with(config)
-        passed_config = mock_model.setup_validation_data.call_args[0][0]
-        assert passed_config.use_lhotse is True
-        assert 'dataset' in passed_config
-        assert passed_config.dataset.input_cfg[0].type == 'lhotse_shar'
-
-    @pytest.mark.run_only_on('CPU')
-    @pytest.mark.unit
-    def test_legacy_non_lhotse_style_deprecated_but_functional(self, mock_model):
-        """Legacy non-lhotse config (dataset._target_: MagpieTTSDataset) emits warning but still works."""
-        # Config structure from magpietts.yaml (non-lhotse style)
-        config = OmegaConf.create(
-            {
-                'dataset': {
-                    '_target_': 'nemo.collections.tts.data.text_to_speech_dataset.MagpieTTSDataset',
-                    'dataset_meta': '/path/to/meta.yaml',
-                },
-                'dataloader_params': {'batch_size': 16},
-            }
-        )
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            MagpieTTSModel.setup_multiple_validation_data(mock_model, config)
-            deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            assert len(deprecation_warnings) == 1, "Legacy non-lhotse config should emit deprecation warning"
-            assert "deprecated" in str(deprecation_warnings[0].message).lower()
-
-        # Should still call setup_validation_data with original config
-        mock_model.setup_validation_data.assert_called_once_with(config)
-        passed_config = mock_model.setup_validation_data.call_args[0][0]
-        assert passed_config.dataset._target_ == 'nemo.collections.tts.data.text_to_speech_dataset.MagpieTTSDataset'
-        assert passed_config.dataloader_params.batch_size == 16
-
     # ==================== Error Case Tests ====================
 
     @pytest.mark.run_only_on('CPU')
     @pytest.mark.unit
-    def test_empty_datasets_raises_error(self, mock_model):
-        """Empty 'datasets' list should raise ValueError."""
+    def test_missing_datasets_key_raises_value_error(self, mock_model):
+        """Config without 'datasets' key raises ValueError."""
+        config = OmegaConf.create({'use_lhotse': True, 'batch_duration': 100})
+
+        with pytest.raises(ValueError) as exc_info:
+            MagpieTTSModel.setup_multiple_validation_data(mock_model, config)
+
+        assert "datasets" in str(exc_info.value).lower()
+
+    @pytest.mark.run_only_on('CPU')
+    @pytest.mark.unit
+    def test_empty_datasets_list_raises_value_error(self, mock_model):
+        """Empty 'datasets' list raises ValueError."""
         config = OmegaConf.create({'use_lhotse': True, 'datasets': []})
 
         with pytest.raises(ValueError) as exc_info:
