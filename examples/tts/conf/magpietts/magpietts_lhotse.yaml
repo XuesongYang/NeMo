@@ -1,6 +1,7 @@
 name: Magpie-TTS
 
 quadratic_duration: 20  # both training and validation datasets can apply same quadratic_duration.
+
 model:
   use_lhotse: true
   model_type: "decoder_ce" # decoder_context_tts or decoder_ce
@@ -16,7 +17,7 @@ model:
   alignment_loss_scale: 0.002
   embedding_dim: 768
   codecmodel_path: ???
-  cfg_unconditional_prob: 0.1
+  cfg_unconditional_prob: 0.1  # enable classifier-free guidance during traing by dropping out conditionals with this probability
 
   # Alignment encoder parameters, to binarize the prior
   # This is used for attention-constrained training and inference
@@ -188,10 +189,9 @@ trainer:
   precision: 32
   max_steps: ???
   accumulate_grad_batches: 1
-  enable_checkpointing: False # Provided by exp_manager
-  logger: false # Provided by exp_manager
+  enable_checkpointing: false  # Provided by exp_manager
+  logger: false  # Provided by exp_manager
   log_every_n_steps: 100
-  check_val_every_n_epoch: 1
   limit_train_batches: 1_000
   val_check_interval: 1_000
   num_sanity_val_steps: 0
