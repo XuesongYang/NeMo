@@ -3020,7 +3020,7 @@ class MagpieTTSModel(ModelPT):
                 # Per-layer attention visualization
                 for layer_idx in self.transcript_decoder_layers:
                     layer_cross_attention_probs = [attn_info[layer_idx]['cross_attn_probabilities'][0]]
-                    attention_data[f'layer_{layer_idx}'] = self._prepare_attention_images(
+                    attention_data[f'layer_{layer_idx:02d}'] = self._prepare_attention_images(
                         layer_cross_attention_probs,
                         audio_codes_lens_target,
                         text_lens,
