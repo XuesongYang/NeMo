@@ -2007,13 +2007,13 @@ class MagpieTTSModel(ModelPT):
 
                 if is_wandb:
                     wandb_log_dict[f"Image:{prefix}/attention_matrix"] = [
-                        wandb.Image(img_np, caption=f"Example_{idx}") for idx, img_np in enumerate(images)
+                        wandb.Image(img_np, caption=f"Example_{idx:02d}") for idx, img_np in enumerate(images)
                     ]
 
                 if is_tb:
                     for idx, img_np in enumerate(images):
                         logger.experiment.add_image(
-                            f'{prefix}/attention_matrix/Example_{idx}',
+                            f'{prefix}/attention_matrix/Example_{idx:02d}',
                             img_np,
                             global_step=global_step,
                             dataformats="HWC",
