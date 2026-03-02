@@ -492,7 +492,7 @@ def plot_expert_usage_heatmap_to_numpy(
     """
     Render a layer-wise expert usage heatmap and return it as a numpy image.
 
-    Rows = decoder layers, columns = experts.
+    Rows = decoder layers (bottom = layer 0), columns = experts.
     Cell values are delta from ideal usage (usage - ideal), so 0 = perfectly balanced,
     positive = overused, negative = underused.
 
@@ -515,16 +515,20 @@ def plot_expert_usage_heatmap_to_numpy(
     abs_max = max(np.abs(delta).max(), 1e-9)
     norm = TwoSlopeNorm(vcenter=0.0, vmin=-abs_max, vmax=abs_max)
 
-    fig, ax = plt.subplots(figsize=(max(6, num_experts * 0.55), max(2.4, n_layers * 0.4)))
-    im = ax.imshow(delta, aspect='auto', cmap='RdBu_r', norm=norm)
+    dpi = 150
+    fig, ax = plt.subplots(
+        figsize=(max(6, num_experts * 0.55), max(2.4, n_layers * 0.4)),
+        dpi=dpi,
+    )
+    im = ax.imshow(delta, aspect='auto', cmap='RdBu_r', norm=norm, origin='lower', interpolation='nearest')
 
     ax.set_xticks(range(num_experts))
     ax.set_xticklabels(col_labels, fontsize=7)
     ax.set_yticks(range(n_layers))
     ax.set_yticklabels(row_labels, fontsize=7)
-    ax.set_xlabel("Expert", fontsize=8)
-    ax.set_ylabel("Layer", fontsize=8)
-    ax.set_title(title, fontsize=9, pad=8)
+    ax.set_xlabel("Experts", fontsize=8)
+    ax.set_ylabel("Layers", fontsize=8)
+    ax.set_title(f"{title}\nideal = {ideal_usage:.4f}", fontsize=9, pad=8)
 
     for row in range(n_layers):
         for col in range(num_experts):

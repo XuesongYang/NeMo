@@ -2818,18 +2818,11 @@ class MagpieTTSModel(ModelPT):
                 valid_selections = (merged_indices != -1).sum().float().clamp_min(1.0)
                 expert_selection_freq = expert_selection_counts / valid_selections
 
-                # Compute load balance metrics (from global expert usage)
-                batch_expert_usage_variance = expert_usage.var()
-                batch_expert_usage_max = expert_usage.max()
-                batch_expert_usage_min = expert_usage.min()
-
                 moe_expert_usage_stats = {
                     'expert_usage': expert_usage.detach(),  # (num_experts,)
                     'layer_expert_usage': layer_expert_usage.detach(),  # (n_layers, num_experts)
                     'expert_selection_freq': expert_selection_freq.detach(),  # (num_experts,)
-                    'batch_expert_usage_variance': batch_expert_usage_variance.detach(),
-                    'batch_expert_usage_max': batch_expert_usage_max.detach(),
-                    'batch_expert_usage_min': batch_expert_usage_min.detach(),
+                    'batch_expert_usage_variance': expert_usage.var().detach(),
                     'ideal_usage': 1.0 / num_experts,
                 }
 
@@ -2881,18 +2874,15 @@ class MagpieTTSModel(ModelPT):
         moe_load_balancing_loss = batch_output.get('moe_load_balancing_loss', None)
         moe_router_z_loss = batch_output.get('moe_router_z_loss', None)
         moe_expert_usage_stats = batch_output.get('moe_expert_usage_stats', None)
-        if moe_load_balancing_loss is not None:
+        if moe_load_balancing_loss is not None and self.moe_auxiliary_loss.load_balancing_loss.loss_scale > 0:
             self.log('Loss:train/moe_load_balancing_loss', moe_load_balancing_loss, prog_bar=True, sync_dist=True)
-        if moe_router_z_loss is not None:
+        if moe_router_z_loss is not None and self.moe_auxiliary_loss.router_z_loss.loss_scale > 0:
             self.log('Loss:train/moe_router_z_loss', moe_router_z_loss, prog_bar=True, sync_dist=True)
         if moe_expert_usage_stats is not None:
             expert_usage = moe_expert_usage_stats['expert_usage']
             layer_expert_usage = moe_expert_usage_stats['layer_expert_usage']
 
-            # Aggregate scalars
             self.log('Loss:train/moe_expert_usage_variance', moe_expert_usage_stats['batch_expert_usage_variance'], sync_dist=True)
-            self.log('Loss:train/moe_expert_usage_max', moe_expert_usage_stats['batch_expert_usage_max'], sync_dist=True)
-            self.log('Loss:train/moe_expert_usage_min', moe_expert_usage_stats['batch_expert_usage_min'], sync_dist=True)
 
             # Per-expert usage scalars
             for eidx in range(len(expert_usage)):
@@ -3755,20 +3745,18 @@ class MagpieTTSModel(ModelPT):
             log_dict['aligner_encoder_loss'] = val_aligner_encoder_loss
         if val_local_transformer_loss is not None:
             log_dict['local_transformer_loss'] = val_local_transformer_loss
-        if val_moe_load_balancing_loss is not None:
+        if val_moe_load_balancing_loss is not None and self.moe_auxiliary_loss.load_balancing_loss.loss_scale > 0:
             log_dict['moe_load_balancing_loss'] = val_moe_load_balancing_loss
-        if val_moe_router_z_loss is not None:
+        if val_moe_router_z_loss is not None and self.moe_auxiliary_loss.router_z_loss.loss_scale > 0:
             log_dict['moe_router_z_loss'] = val_moe_router_z_loss
         if moe_expert_data is not None:
             val_moe_expert_usage = moe_expert_data['moe_expert_usage']
-            log_dict['moe_expert_usage_variance'] = val_moe_expert_usage.var()
-            log_dict['moe_expert_usage_max'] = val_moe_expert_usage.max()
-            log_dict['moe_expert_usage_min'] = val_moe_expert_usage.min()
+            usage_variance = val_moe_expert_usage.var()
 
             logging.info(
                 f"MoE Expert Usage (Epoch Mean) for dataloader {dataloader_idx} - Ideal: {moe_expert_data['ideal_usage']:.4f} per expert, "
-                f"Variance: {log_dict['moe_expert_usage_variance']:.6f} "
-                f"({'Balanced' if log_dict['moe_expert_usage_variance'] < 0.01 else 'Imbalanced'})"
+                f"Variance: {usage_variance:.6f} "
+                f"({'Balanced' if usage_variance < 0.01 else 'Imbalanced'})"
             )
 
         return log_dict, moe_expert_data
