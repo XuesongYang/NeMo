@@ -54,6 +54,7 @@ from nemo.collections.tts.parts.utils.helpers import (
     binarize_attention_parallel,
     get_mask_from_lengths,
     plot_alignment_to_numpy,
+    plot_expert_usage_heatmap_to_numpy,
 )
 from nemo.collections.tts.parts.utils.tts_dataset_utils import (
     chunk_and_tokenize_text_by_sentence,
@@ -630,9 +631,11 @@ class MagpieTTSModel(ModelPT):
                 f"Each expert has d_ffn={cfg.decoder.d_ffn}. "
                 f"Loss scales: router_load_balancing={router_load_balancing_loss_coeff}, router_z={router_z_loss_coeff}"
             )
-            # Lazily initialized when WandB logger is available
-            self._moe_expert_usage_train_table: Optional[wandb.Table] = None
-            self._moe_expert_usage_val_table: Optional[wandb.Table] = None
+            # Training-side accumulator for layer-wise expert usage heatmap.
+            # Accumulated every training_step, rendered + reset at each validation interval.
+            self._moe_num_experts = num_experts
+            self._moe_train_layer_usage_accum: Optional[torch.Tensor] = None  # (n_layers, num_experts)
+            self._moe_train_accum_steps: int = 0
 
         # Define cfg parameters into self parameters
         self.prior_end_step = self.cfg.prior_end_step
@@ -2787,14 +2790,22 @@ class MagpieTTSModel(ModelPT):
                 x_mask=merged_mask,
             )
 
-            # Compute expert usage statistics (averaged across all layers, batches, and valid tokens)
+            # Compute expert usage statistics
             with torch.no_grad():
-                # Use shared utility function for computing expert usage
-                expert_usage = compute_expert_usage(merged_probs, merged_mask)  # (num_experts,)
+                num_experts = stacked_probs.size(-1)
+                n_moe_layers = stacked_probs.size(0)
+
+                # Per-layer expert usage: (n_layers, num_experts)
+                layer_expert_usage = torch.stack([
+                    compute_expert_usage(stacked_probs[i], audio_codes_mask)
+                    for i in range(n_moe_layers)
+                ])
+
+                # Global expert usage: mean across layers (for scalar logging)
+                expert_usage = layer_expert_usage.mean(dim=0)  # (num_experts,)
 
                 # Compute how often each expert is selected in top-k
                 # For padded positions, expert_indices=-1, so they don't match any valid expert (0 to num_experts-1)
-                num_experts = merged_probs.size(-1)
                 expert_selection_counts = torch.zeros(num_experts, device=merged_probs.device)
                 for expert_idx in range(num_experts):
                     expert_selection_counts[expert_idx] = (merged_indices == expert_idx).float().sum()
@@ -2804,13 +2815,14 @@ class MagpieTTSModel(ModelPT):
                 valid_selections = (merged_indices != -1).sum().float().clamp_min(1.0)
                 expert_selection_freq = expert_selection_counts / valid_selections
 
-                # Compute load balance metrics
+                # Compute load balance metrics (from global expert usage)
                 batch_expert_usage_variance = expert_usage.var()
                 batch_expert_usage_max = expert_usage.max()
                 batch_expert_usage_min = expert_usage.min()
 
                 moe_expert_usage_stats = {
                     'expert_usage': expert_usage.detach(),  # (num_experts,)
+                    'layer_expert_usage': layer_expert_usage.detach(),  # (n_layers, num_experts)
                     'expert_selection_freq': expert_selection_freq.detach(),  # (num_experts,)
                     'batch_expert_usage_variance': batch_expert_usage_variance.detach(),
                     'batch_expert_usage_max': batch_expert_usage_max.detach(),
@@ -2871,37 +2883,23 @@ class MagpieTTSModel(ModelPT):
         if moe_router_z_loss is not None:
             self.log('Loss:train/moe_router_z_loss', moe_router_z_loss, prog_bar=True, sync_dist=True)
         if moe_expert_usage_stats is not None:
+            expert_usage = moe_expert_usage_stats['expert_usage']
+            layer_expert_usage = moe_expert_usage_stats['layer_expert_usage']
+
+            # Aggregate scalars
             self.log('Loss:train/moe_expert_usage_variance', moe_expert_usage_stats['batch_expert_usage_variance'], sync_dist=True)
             self.log('Loss:train/moe_expert_usage_max', moe_expert_usage_stats['batch_expert_usage_max'], sync_dist=True)
             self.log('Loss:train/moe_expert_usage_min', moe_expert_usage_stats['batch_expert_usage_min'], sync_dist=True)
 
-            # Log per-expert usage to incremental table at the same frequency as other metrics.
-            # Unlike self.log() which is auto-throttled by Lightning's log_every_n_steps,
-            # logger.experiment.log() is a raw WandB API call that fires every invocation,
-            # so we manually gate on log_every_n_steps here.
-            if self.global_rank == 0 and self.global_step % self.trainer.log_every_n_steps == 0:
-                for logger in self.loggers:
-                    if not isinstance(logger, WandbLogger):
-                        continue
-                    if self._moe_expert_usage_train_table is None:
-                        self._moe_expert_usage_train_table = wandb.Table(
-                            columns=["global_step", "expert", "usage", "selection_freq"],
-                            log_mode="INCREMENTAL",
-                        )
-                    expert_usage = moe_expert_usage_stats['expert_usage']
-                    expert_sel_freq = moe_expert_usage_stats['expert_selection_freq']
-                    ideal = moe_expert_usage_stats['ideal_usage']
-                    self._moe_expert_usage_train_table.add_data(
-                        int(self.global_step), "Ideal", ideal, ideal,
-                    )
-                    for eidx in range(len(expert_usage)):
-                        self._moe_expert_usage_train_table.add_data(
-                            int(self.global_step),
-                            f"Expert_{eidx:02d}",
-                            float(expert_usage[eidx]),
-                            float(expert_sel_freq[eidx]),
-                        )
-                    logger.experiment.log({"MoE/train_expert_usage_history": self._moe_expert_usage_train_table})
+            # Per-expert usage scalars
+            for eidx in range(len(expert_usage)):
+                self.log(f'MoE:train/Expert_{eidx:02d}_usage', expert_usage[eidx], sync_dist=True)
+
+            # Accumulate layer-wise usage for training heatmap
+            if self._moe_train_layer_usage_accum is None:
+                self._moe_train_layer_usage_accum = torch.zeros_like(layer_expert_usage)
+            self._moe_train_layer_usage_accum += layer_expert_usage.detach()
+            self._moe_train_accum_steps += 1
 
         # Log batch info
         batch_size, text_token_max_len = batch["text"].shape
@@ -3733,10 +3731,12 @@ class MagpieTTSModel(ModelPT):
         if len(val_moe_expert_usage_stats) > 0:
             val_moe_expert_usage = collect_required_metric(val_moe_expert_usage_stats, 'expert_usage', dim=0)
             val_moe_expert_selection_freq = collect_required_metric(val_moe_expert_usage_stats, 'expert_selection_freq', dim=0)
+            val_layer_expert_usage = collect_required_metric(val_moe_expert_usage_stats, 'layer_expert_usage', dim=0)
             ideal_usage = val_moe_expert_usage_stats[0]['ideal_usage']
             moe_expert_data = {
                 'moe_expert_usage': val_moe_expert_usage,
                 'moe_expert_selection_freq': val_moe_expert_selection_freq,
+                'layer_expert_usage': val_layer_expert_usage,
                 'ideal_usage': ideal_usage,
             }
 
@@ -3845,37 +3845,47 @@ class MagpieTTSModel(ModelPT):
             enable_graph=False,
         )
 
-        # Log MoE expert usage to an incremental wandb.Table so usage history is trackable
-        # as curves in the WandB UI. Each row: (global_step, dataset, expert, usage, selection_freq).
-        if all_moe_expert_data and self.global_rank == 0:
-            global_step = int(self.global_step)
-            for logger in self.loggers:
-                if not isinstance(logger, WandbLogger):
-                    continue
+        # Log per-expert scalars + layer-wise heatmap images for MoE monitoring.
+        # Per-expert scalars auto-generate WandB line charts; heatmaps show layer×expert routing structure.
+        if all_moe_expert_data:
+            for dataset_name, moe_data in all_moe_expert_data:
+                expert_usage = moe_data['moe_expert_usage']
+                expert_sel_freq = moe_data['moe_expert_selection_freq']
 
-                if self._moe_expert_usage_val_table is None:
-                    self._moe_expert_usage_val_table = wandb.Table(
-                        columns=["global_step", "dataset", "expert", "usage", "selection_freq"],
-                        log_mode="INCREMENTAL",
-                    )
+                for eidx in range(len(expert_usage)):
+                    self.log(f'MoE:{dataset_name}/Expert_{eidx:02d}_usage', expert_usage[eidx], sync_dist=True)
+                    self.log(f'MoE:{dataset_name}/Expert_{eidx:02d}_selection_freq', expert_sel_freq[eidx], sync_dist=True)
 
+            if self.global_rank == 0:
+                wandb_heatmaps = {}
+
+                # Validation heatmaps (one per dataset, layer-wise from epoch-averaged usage)
                 for dataset_name, moe_data in all_moe_expert_data:
-                    expert_usage = moe_data['moe_expert_usage']
-                    expert_sel_freq = moe_data['moe_expert_selection_freq']
-                    ideal = moe_data['ideal_usage']
-                    self._moe_expert_usage_val_table.add_data(
-                        global_step, dataset_name, "Ideal", ideal, ideal,
+                    heatmap_np = plot_expert_usage_heatmap_to_numpy(
+                        layer_expert_usage=moe_data['layer_expert_usage'].float().cpu().numpy(),
+                        ideal_usage=moe_data['ideal_usage'],
+                        title=f"MoE Expert Usage — {dataset_name} (step {int(self.global_step)})",
                     )
-                    for eidx in range(len(expert_usage)):
-                        self._moe_expert_usage_val_table.add_data(
-                            global_step,
-                            dataset_name,
-                            f"Expert_{eidx:02d}",
-                            float(expert_usage[eidx]),
-                            float(expert_sel_freq[eidx]),
-                        )
+                    wandb_heatmaps[f"MoE:{dataset_name}/expert_usage_heatmap"] = wandb.Image(heatmap_np)
 
-                logger.experiment.log({"MoE/val_expert_usage_history": self._moe_expert_usage_val_table})
+                # Training heatmap (layer-wise, from accumulated usage since last validation)
+                if self._moe_train_layer_usage_accum is not None and self._moe_train_accum_steps > 0:
+                    avg_layer_usage = self._moe_train_layer_usage_accum / self._moe_train_accum_steps
+                    heatmap_np = plot_expert_usage_heatmap_to_numpy(
+                        layer_expert_usage=avg_layer_usage.float().cpu().numpy(),
+                        ideal_usage=1.0 / self._moe_num_experts,
+                        title=f"MoE Expert Usage — train ({self._moe_train_accum_steps} steps avg, step {int(self.global_step)})",
+                    )
+                    wandb_heatmaps["MoE:train/expert_usage_heatmap"] = wandb.Image(heatmap_np)
+
+                    # Reset accumulator
+                    self._moe_train_layer_usage_accum.zero_()
+                    self._moe_train_accum_steps = 0
+
+                if wandb_heatmaps:
+                    for logger in self.loggers:
+                        if isinstance(logger, WandbLogger):
+                            logger.experiment.log(wandb_heatmaps)
 
         return {}
 
