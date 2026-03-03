@@ -1926,7 +1926,7 @@ class MagpieTTSModel(ModelPT):
                 'context_audios': context_audios,
             }
 
-    def _log_media_to_wandb_and_tb(
+    def _collect_wandb_media_and_log_tb(
         self,
         *,
         dataset_prefix: str,
@@ -1935,12 +1935,14 @@ class MagpieTTSModel(ModelPT):
         context_audios: List[Optional[np.ndarray]],
         attention_data: Dict[str, List[np.ndarray]],
         global_step: int,
-    ) -> None:
+    ) -> Dict[str, Any]:
         """
-        Log audio examples and attention images to WandB and/or TensorBoard.
+        Collect WandB media entries and log audio/attention to TensorBoard.
 
-        This method creates wandb.Audio/wandb.Image objects and logs them.
-        It batches all WandB logs into a single call for efficiency.
+        TensorBoard logging happens directly within this method.
+        WandB media is returned as a dict to be merged with other WandB media
+        (e.g., MoE heatmaps) into a single wandb.log() call by the caller,
+        ensuring all media shares the same WandB step index.
 
         Args:
             dataset_prefix: Prefix for log keys (e.g., 'val', 'val_set_0').
@@ -1949,7 +1951,13 @@ class MagpieTTSModel(ModelPT):
             context_audios: List of context audio waveforms (or None per entry if unavailable).
             attention_data: Dict mapping attention names to lists of numpy images.
             global_step: Current training step for logging.
+
+        Returns:
+            Dict of WandB-ready media entries (audio + attention images).
+            Empty dict if no WandB logger is configured.
         """
+        wandb_media: Dict[str, Any] = {}
+
         for logger in self.loggers:
             is_wandb = isinstance(logger, WandbLogger)
             is_tb = isinstance(logger, TensorBoardLogger)
@@ -1959,9 +1967,6 @@ class MagpieTTSModel(ModelPT):
                     f"Only WandbLogger and TensorBoardLogger are supported for media logging."
                 )
 
-            wandb_log_dict = {}
-
-            # Log audio examples
             for idx, (pred_audio_np, target_audio_np, context_audio_np) in enumerate(
                 zip(pred_audios, target_audios, context_audios)
             ):
@@ -1977,7 +1982,7 @@ class MagpieTTSModel(ModelPT):
                     audio_list.append(
                         wandb.Audio(target_audio_np, sample_rate=self.output_sample_rate, caption="target")
                     )
-                    wandb_log_dict[f"Audio:{dataset_prefix}/Example_{idx}"] = audio_list
+                    wandb_media[f"Audio:{dataset_prefix}/Example_{idx:02d}"] = audio_list
 
                 if is_tb:
                     if context_audio_np is not None and context_audio_np.shape[0] > 0:
@@ -2009,7 +2014,7 @@ class MagpieTTSModel(ModelPT):
                     prefix = f"{dataset_prefix}/{attn_key}"
 
                 if is_wandb:
-                    wandb_log_dict[f"Image:{prefix}/attention_matrix"] = [
+                    wandb_media[f"Image:{prefix}/attention_matrix"] = [
                         wandb.Image(img_np, caption=f"Example_{idx:02d}") for idx, img_np in enumerate(images)
                     ]
 
@@ -2022,9 +2027,7 @@ class MagpieTTSModel(ModelPT):
                             dataformats="HWC",
                         )
 
-            # Perform single wandb log call
-            if is_wandb and wandb_log_dict:
-                logger.experiment.log(wandb_log_dict)
+        return wandb_media
 
     def scale_prior(self, prior, global_step):
         if prior is None:
@@ -3746,15 +3749,6 @@ class MagpieTTSModel(ModelPT):
             log_dict['moe_load_balancing_loss'] = val_moe_load_balancing_loss
         if val_moe_router_z_loss is not None and self.moe_auxiliary_loss.router_z_loss.loss_scale > 0:
             log_dict['moe_router_z_loss'] = val_moe_router_z_loss
-        if moe_expert_data is not None:
-            val_moe_expert_usage = moe_expert_data['moe_expert_usage']
-            usage_variance = val_moe_expert_usage.var()
-
-            logging.info(
-                f"MoE Expert Usage (Epoch Mean) for dataloader {dataloader_idx} - Ideal: {moe_expert_data['ideal_usage']:.4f} per expert, "
-                f"Variance: {usage_variance:.6f} "
-                f"({'Balanced' if usage_variance < 0.01 else 'Imbalanced'})"
-            )
 
         return log_dict, moe_expert_data
 
@@ -3762,26 +3756,20 @@ class MagpieTTSModel(ModelPT):
         """
         Computes and logs metrics across all validation dataloaders.
 
-        This method:
-        1. Computes per-dataloader metrics from validation outputs.
-        2. Logs per-dataloader metrics as "Loss:<dataset_name>/<metric>".
-        3. For multiple dataloaders, also logs averaged metrics as "Loss:val_avg/<metric>".
-        4. Uses (averaged if multi-DL, direct if single-DL) val_loss for checkpointing.
+        Three-phase structure:
+        1. Compute — aggregates metrics and collect media/heatmap data from all dataloaders.
+        2. WandB media — logs all non-scalar media (audio, attention images, MoE heatmaps).
+        3. Scalars — logs loss metrics and per-expert usage scalars.
         """
         if len(self.validation_step_outputs) == 0:
             return {}
 
         num_dataloaders = len(self.validation_step_outputs)
 
-        # Log media (audio + attention images) from first batch of each dataloader.
-        if self.global_rank == 0:
-            global_step = int(self.global_step)
-            for val_outputs in self.validation_step_outputs:
-                if len(val_outputs) > 0 and 'media_data' in val_outputs[0]:
-                    self._log_media_to_wandb_and_tb(**val_outputs[0]['media_data'], global_step=global_step)
-
-        # Process each dataloader. Each entry is (dataset_name, moe_expert_data_dict)
+        # --- Phase 1: Compute all metrics + collect media data ---
         all_moe_expert_data: List[Tuple[str, Dict[str, torch.Tensor]]] = []
+        all_media_data: List[Dict[str, Any]] = []
+        per_dl_logs: List[Tuple[str, Dict[str, torch.Tensor]]] = []
         aggregated_metrics: Dict[str, List[torch.Tensor]] = {}
 
         for dataloader_idx, val_outputs in enumerate(self.validation_step_outputs):
@@ -3796,12 +3784,15 @@ class MagpieTTSModel(ModelPT):
             )
 
             dataloader_prefix = self.get_validation_dataloader_prefix(dataloader_idx)
+            per_dl_logs.append((dataloader_prefix, dataloader_logs))
 
             if moe_expert_data is not None:
                 all_moe_expert_data.append((dataloader_prefix, moe_expert_data))
 
+            if len(val_outputs) > 0 and 'media_data' in val_outputs[0]:
+                all_media_data.append(val_outputs[0]['media_data'])
+
             for metric_name, metric_value in dataloader_logs.items():
-                self.log(f"Loss:{dataloader_prefix}/{metric_name}", metric_value, prog_bar=(num_dataloaders == 1), sync_dist=True)
                 aggregated_metrics.setdefault(metric_name, []).append(metric_value)
 
         for idx in range(num_dataloaders):
@@ -3812,7 +3803,47 @@ class MagpieTTSModel(ModelPT):
             if required_metric not in aggregated_metrics or len(aggregated_metrics[required_metric]) == 0:
                 raise ValueError(f"No {required_metric} collected from any dataloader.")
 
-        # Determine checkpoint loss: averaged across dataloaders (multi-DL) or direct (single-DL).
+        # --- Phase 2: Single WandB media log (rank 0 only) ---
+        if self.global_rank == 0:
+            global_step = int(self.global_step)
+            wandb_media: Dict[str, Any] = {}
+
+            for media_data in all_media_data:
+                media_entries = self._collect_wandb_media_and_log_tb(**media_data, global_step=global_step)
+                wandb_media.update(media_entries)
+
+            # heatmaps show layer×expert routing structure
+            if all_moe_expert_data:
+                for dataset_name, moe_data in all_moe_expert_data:
+                    heatmap_np = plot_expert_usage_heatmap_to_numpy(
+                        layer_expert_usage=moe_data['layer_expert_usage'].float().cpu().numpy(),
+                        ideal_usage=moe_data['ideal_usage'],
+                        title=f"MoE Expert Usage — {dataset_name} (step {int(self.global_step)})",
+                    )
+                    wandb_media[f"MoE:{dataset_name}/expert_usage_heatmap"] = wandb.Image(heatmap_np)
+
+                if self._moe_train_layer_usage_accum is not None and self._moe_train_accum_steps > 0:
+                    avg_layer_usage = self._moe_train_layer_usage_accum / self._moe_train_accum_steps
+                    heatmap_np = plot_expert_usage_heatmap_to_numpy(
+                        layer_expert_usage=avg_layer_usage.float().cpu().numpy(),
+                        ideal_usage=1.0 / self._moe_num_experts,
+                        title=f"MoE Expert Usage — train ({self._moe_train_accum_steps} steps avg, step {int(self.global_step)})",
+                    )
+                    wandb_media["MoE:train/expert_usage_heatmap"] = wandb.Image(heatmap_np)
+
+                    self._moe_train_layer_usage_accum.zero_()
+                    self._moe_train_accum_steps = 0
+
+            if wandb_media:
+                for logger in self.loggers:
+                    if isinstance(logger, WandbLogger):
+                        logger.experiment.log(wandb_media, commit=False)
+
+        # --- Phase 3: Scalar metrics ---
+        for dataloader_prefix, dataloader_logs in per_dl_logs:
+            for metric_name, metric_value in dataloader_logs.items():
+                self.log(f"Loss:{dataloader_prefix}/{metric_name}", metric_value, prog_bar=(num_dataloaders == 1), sync_dist=True)
+
         checkpoint_loss = aggregated_metrics['loss'][0]
         if num_dataloaders > 1:
             for metric_name, metric_values in aggregated_metrics.items():
@@ -3833,8 +3864,6 @@ class MagpieTTSModel(ModelPT):
             enable_graph=False,
         )
 
-        # Log per-expert scalars + layer-wise heatmap images for MoE monitoring.
-        # Per-expert scalars auto-generate WandB line charts; heatmaps show layer×expert routing structure.
         if all_moe_expert_data:
             for dataset_name, moe_data in all_moe_expert_data:
                 expert_usage = moe_data['moe_expert_usage']
@@ -3843,37 +3872,6 @@ class MagpieTTSModel(ModelPT):
                 for eidx in range(len(expert_usage)):
                     self.log(f'MoE:{dataset_name}/Expert_{eidx:02d}_usage', expert_usage[eidx], sync_dist=True)
                     self.log(f'MoE:{dataset_name}/Expert_{eidx:02d}_selection_freq', expert_sel_freq[eidx], sync_dist=True)
-
-            if self.global_rank == 0:
-                wandb_heatmaps = {}
-
-                # Validation heatmaps (one per dataset, layer-wise from epoch-averaged usage)
-                for dataset_name, moe_data in all_moe_expert_data:
-                    heatmap_np = plot_expert_usage_heatmap_to_numpy(
-                        layer_expert_usage=moe_data['layer_expert_usage'].float().cpu().numpy(),
-                        ideal_usage=moe_data['ideal_usage'],
-                        title=f"MoE Expert Usage — {dataset_name} (step {int(self.global_step)})",
-                    )
-                    wandb_heatmaps[f"MoE:{dataset_name}/expert_usage_heatmap"] = wandb.Image(heatmap_np)
-
-                # Training heatmap (layer-wise, from accumulated usage since last validation)
-                if self._moe_train_layer_usage_accum is not None and self._moe_train_accum_steps > 0:
-                    avg_layer_usage = self._moe_train_layer_usage_accum / self._moe_train_accum_steps
-                    heatmap_np = plot_expert_usage_heatmap_to_numpy(
-                        layer_expert_usage=avg_layer_usage.float().cpu().numpy(),
-                        ideal_usage=1.0 / self._moe_num_experts,
-                        title=f"MoE Expert Usage — train ({self._moe_train_accum_steps} steps avg, step {int(self.global_step)})",
-                    )
-                    wandb_heatmaps["MoE:train/expert_usage_heatmap"] = wandb.Image(heatmap_np)
-
-                    # Reset accumulator
-                    self._moe_train_layer_usage_accum.zero_()
-                    self._moe_train_accum_steps = 0
-
-                if wandb_heatmaps:
-                    for logger in self.loggers:
-                        if isinstance(logger, WandbLogger):
-                            logger.experiment.log(wandb_heatmaps)
 
         return {}
 
