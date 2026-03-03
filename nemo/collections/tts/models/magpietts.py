@@ -3891,8 +3891,14 @@ class MagpieTTSModel(ModelPT):
         return {}
 
     def get_dataset(self, dataset_cfg, dataset_type):
+        if 'datasets' not in dataset_cfg or not isinstance(dataset_cfg.datasets, (dict, DictConfig)):
+            raise ValueError(
+                "Expected 'datasets' key (dict) in dataset config with _target_, dataset_meta, etc. "
+                f"Got keys: {list(dataset_cfg.keys())}"
+            )
+
         dataset = instantiate(
-            dataset_cfg.dataset,
+            dataset_cfg.datasets,
             sample_rate=self.sample_rate,
             bos_id=self.bos_id,
             eos_id=self.eos_id,
@@ -3918,9 +3924,24 @@ class MagpieTTSModel(ModelPT):
     def setup_multiple_validation_data(self, val_data_config: Union[DictConfig, Dict]):
         """
         Setup validation data with support for multiple datasets.
-        Overrides parent class to handle Lhotse dataloaders with multiple datasets.
+        Overrides parent class to handle both non-lhotse and lhotse dataloaders.
 
-        The config structure expected:
+        Non-lhotse config (datasets is a dict — single dataloader, multiplicity via dataset_meta):
+            validation_ds:
+                datasets:
+                    _target_: nemo.collections.tts.data.text_to_speech_dataset.MagpieTTSDataset
+                    dataset_meta: ...
+                    min_duration: 0.2
+                    max_duration: 20.0
+                dataloader_params: ...
+
+            Note: Non-lhotse creates a single dataloader even when dataset_meta contains
+            multiple entries (e.g., {en: ..., es: ...}). All datasets are mixed in one
+            dataloader, so validation metrics are logged jointly (e.g., prefix "en+es")
+            rather than per-dataset. For per-dataset validation metrics, use the lhotse
+            config with separate datasets list entries.
+
+        Lhotse config (datasets is a list — multiple dataloaders):
             validation_ds:
                 use_lhotse: true
                 # ... shared settings ...
@@ -3938,33 +3959,42 @@ class MagpieTTSModel(ModelPT):
         # Preserve config
         self._update_dataset_config(dataset_name='validation', config=val_data_config)
 
-        # Check if datasets is a path to an external YAML file
-        if 'datasets' in val_data_config and isinstance(val_data_config.datasets, (str, Path)):
-            # Load datasets from external YAML file (supports local paths and remote URLs like s3://)
-            datasets_file_path = val_data_config.datasets
-            logging.info(f"Loading validation datasets from external file: {datasets_file_path}")
-            datasets_list = OmegaConf.create(load_yaml(datasets_file_path))
-            # Replace the string path with the loaded list in config
-            with open_dict(val_data_config):
-                val_data_config.datasets = datasets_list
-
         if 'datasets' not in val_data_config:
             raise ValueError(
-                "validation_ds config must contain a 'datasets' key with a list of dataset configurations. "
-                "Example:\n"
-                "  validation_ds:\n"
-                "    datasets:\n"
-                "      - name: 'val_set_0'\n"
-                "        input_cfg: [...]\n"
-                "See the magpietts_lhotse.yaml config for examples."
+                "validation_ds config must contain a 'datasets' key. "
+                "For non-lhotse: a dict with _target_, dataset_meta, etc. "
+                "For lhotse: a list of dataset configurations. "
+                "See magpietts.yaml or magpietts_lhotse.yaml for examples."
             )
 
-        datasets_list = val_data_config.datasets
-        if not isinstance(datasets_list, (list, ListConfig)) or len(datasets_list) == 0:
+        datasets_value = val_data_config.datasets
+
+        # Non-lhotse: datasets is a dict (single dataloader, multiplicity via dataset_meta)
+        if isinstance(datasets_value, (dict, DictConfig)):
+            dataset_meta = datasets_value.get('dataset_meta', {})
+            if dataset_meta:
+                val_name = '+'.join(dataset_meta.keys())
+            else:
+                val_name = 'val_set_0'
+            logging.info(f"Setting up single non-lhotse validation dataloader: '{val_name}'")
+            self._validation_names = [val_name]
+            self._validation_dl = [self._setup_test_dataloader(val_data_config)]
+            return
+
+        # Lhotse: datasets is a path to an external YAML file (supports local paths and remote URLs like s3://) or a list
+        if isinstance(datasets_value, (str, Path)):
+            logging.info(f"Loading validation datasets from external file: {datasets_value}")
+            datasets_list = OmegaConf.create(load_yaml(datasets_value))
+        elif isinstance(datasets_value, (list, ListConfig)):
+            datasets_list = datasets_value
+        else:
             raise ValueError(
-                f"'datasets' key in `validation_ds` is empty or invalid. "
-                f"Expected a list with at least one dataset configuration. Got: {datasets_list}"
+                f"Lhotse 'datasets' in `validation_ds` must be a non-empty list of dataset configurations. "
+                f"Got: {type(datasets_value).__name__}"
             )
+
+        if len(datasets_list) == 0:
+            raise ValueError("Lhotse 'datasets' in `validation_ds` must be a non-empty list.")
 
         logging.info(f"Setting up {len(datasets_list)} validation dataset(s)")
 
