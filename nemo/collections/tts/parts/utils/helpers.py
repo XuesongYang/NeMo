@@ -533,7 +533,12 @@ def plot_expert_usage_heatmap_to_numpy(
     for row in range(n_layers):
         for col in range(num_experts):
             ax.text(
-                col, row, f"{delta[row, col]:+.3f}", ha='center', va='center', fontsize=5,
+                col,
+                row,
+                f"{delta[row, col]:+.3f}",
+                ha='center',
+                va='center',
+                fontsize=5,
                 color='white' if abs(delta[row, col]) > abs_max * 0.6 else 'black',
             )
 

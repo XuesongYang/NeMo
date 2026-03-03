@@ -1899,7 +1899,9 @@ class MagpieTTSModel(ModelPT):
                 context_audio_codes, context_audio_codes_lens = self.remove_special_tokens(
                     codes=context_audio_codes, codes_len=context_audio_codes_lens
                 )
-                context_audio, context_audio_lens, _ = self.codes_to_audio(context_audio_codes, context_audio_codes_lens)
+                context_audio, context_audio_lens, _ = self.codes_to_audio(
+                    context_audio_codes, context_audio_codes_lens
+                )
 
             pred_audios = []
             target_audios = []
@@ -2799,10 +2801,9 @@ class MagpieTTSModel(ModelPT):
                 n_moe_layers = stacked_probs.size(0)
 
                 # Per-layer expert usage: (n_layers, num_experts)
-                layer_expert_usage = torch.stack([
-                    compute_expert_usage(stacked_probs[i], audio_codes_mask)
-                    for i in range(n_moe_layers)
-                ])
+                layer_expert_usage = torch.stack(
+                    [compute_expert_usage(stacked_probs[i], audio_codes_mask) for i in range(n_moe_layers)]
+                )
 
                 # Global expert usage: mean across layers (for scalar logging)
                 expert_usage = layer_expert_usage.mean(dim=0)  # (num_experts,)
@@ -2882,7 +2883,11 @@ class MagpieTTSModel(ModelPT):
             expert_usage = moe_expert_usage_stats['expert_usage']
             layer_expert_usage = moe_expert_usage_stats['layer_expert_usage']
 
-            self.log('Loss:train/moe_expert_usage_variance', moe_expert_usage_stats['batch_expert_usage_variance'], sync_dist=True)
+            self.log(
+                'Loss:train/moe_expert_usage_variance',
+                moe_expert_usage_stats['batch_expert_usage_variance'],
+                sync_dist=True,
+            )
 
             # Per-expert usage scalars
             for eidx in range(len(expert_usage)):
@@ -3723,7 +3728,9 @@ class MagpieTTSModel(ModelPT):
         moe_expert_data = None
         if len(val_moe_expert_usage_stats) > 0:
             val_moe_expert_usage = collect_required_metric(val_moe_expert_usage_stats, 'expert_usage', dim=0)
-            val_moe_expert_selection_freq = collect_required_metric(val_moe_expert_usage_stats, 'expert_selection_freq', dim=0)
+            val_moe_expert_selection_freq = collect_required_metric(
+                val_moe_expert_usage_stats, 'expert_selection_freq', dim=0
+            )
             val_layer_expert_usage = collect_required_metric(val_moe_expert_usage_stats, 'layer_expert_usage', dim=0)
             ideal_usage = val_moe_expert_usage_stats[0]['ideal_usage']
             moe_expert_data = {
@@ -3842,7 +3849,12 @@ class MagpieTTSModel(ModelPT):
         # --- Phase 3: Scalar metrics ---
         for dataloader_prefix, dataloader_logs in per_dl_logs:
             for metric_name, metric_value in dataloader_logs.items():
-                self.log(f"Loss:{dataloader_prefix}/{metric_name}", metric_value, prog_bar=(num_dataloaders == 1), sync_dist=True)
+                self.log(
+                    f"Loss:{dataloader_prefix}/{metric_name}",
+                    metric_value,
+                    prog_bar=(num_dataloaders == 1),
+                    sync_dist=True,
+                )
 
         checkpoint_loss = aggregated_metrics['loss'][0]
         if num_dataloaders > 1:
@@ -3871,7 +3883,9 @@ class MagpieTTSModel(ModelPT):
 
                 for eidx in range(len(expert_usage)):
                     self.log(f'MoE:{dataset_name}/Expert_{eidx:02d}_usage', expert_usage[eidx], sync_dist=True)
-                    self.log(f'MoE:{dataset_name}/Expert_{eidx:02d}_selection_freq', expert_sel_freq[eidx], sync_dist=True)
+                    self.log(
+                        f'MoE:{dataset_name}/Expert_{eidx:02d}_selection_freq', expert_sel_freq[eidx], sync_dist=True
+                    )
 
         return {}
 
