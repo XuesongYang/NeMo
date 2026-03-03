@@ -3837,7 +3837,7 @@ class MagpieTTSModel(ModelPT):
             if wandb_media:
                 for logger in self.loggers:
                     if isinstance(logger, WandbLogger):
-                        logger.experiment.log(wandb_media)
+                        logger.experiment.log(wandb_media, commit=False)
 
         # --- Phase 3: Scalar metrics ---
         for dataloader_prefix, dataloader_logs in per_dl_logs:
