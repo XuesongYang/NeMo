@@ -3717,12 +3717,30 @@ class MagpieTTSModel(ModelPT):
         val_loss = collect_required_metric(outputs, 'val_loss')
         val_codebook_loss = collect_required_metric(outputs, 'val_codebook_loss')
 
+        log_dict = {
+            'loss': val_loss,
+            'codebook_loss': val_codebook_loss,
+        }
+
         # Compute optional metrics
-        val_alignment_loss = collect_optional_metric(outputs, 'val_alignment_loss')
-        val_aligner_encoder_loss = collect_optional_metric(outputs, 'val_aligner_encoder_loss')
-        val_local_transformer_loss = collect_optional_metric(outputs, 'val_local_transformer_loss')
-        val_moe_load_balancing_loss = collect_optional_metric(outputs, 'val_moe_load_balancing_loss')
-        val_moe_router_z_loss = collect_optional_metric(outputs, 'val_moe_router_z_loss')
+        VAL_OPTIONAL_METRICS = [
+            'val_alignment_loss',
+            'val_aligner_encoder_loss',
+            'val_local_transformer_loss',
+            'val_moe_load_balancing_loss',
+            'val_moe_router_z_loss',
+        ]
+        for metric_key in VAL_OPTIONAL_METRICS:
+            metric_value = collect_optional_metric(outputs, metric_key)
+            if metric_value is not None:
+                log_dict[metric_key.removeprefix('val_')] = metric_value
+
+        # Exclude MoE metrics whose loss scale is disabled
+        if self.use_moe:
+            if self.moe_auxiliary_loss.load_balancing_loss.loss_scale <= 0:
+                log_dict.pop('moe_load_balancing_loss', None)
+            if self.moe_auxiliary_loss.router_z_loss.loss_scale <= 0:
+                log_dict.pop('moe_router_z_loss', None)
 
         # Collect per-expert usage vectors
         val_moe_expert_usage_stats = [
@@ -3742,23 +3760,6 @@ class MagpieTTSModel(ModelPT):
                 'layer_expert_usage': val_layer_expert_usage,
                 'ideal_usage': ideal_usage,
             }
-
-        log_dict = {
-            'loss': val_loss,
-            'codebook_loss': val_codebook_loss,
-        }
-
-        # Add optional metrics if they were computed
-        if val_alignment_loss is not None:
-            log_dict['alignment_loss'] = val_alignment_loss
-        if val_aligner_encoder_loss is not None:
-            log_dict['aligner_encoder_loss'] = val_aligner_encoder_loss
-        if val_local_transformer_loss is not None:
-            log_dict['local_transformer_loss'] = val_local_transformer_loss
-        if val_moe_load_balancing_loss is not None and self.moe_auxiliary_loss.load_balancing_loss.loss_scale > 0:
-            log_dict['moe_load_balancing_loss'] = val_moe_load_balancing_loss
-        if val_moe_router_z_loss is not None and self.moe_auxiliary_loss.router_z_loss.loss_scale > 0:
-            log_dict['moe_router_z_loss'] = val_moe_router_z_loss
 
         return log_dict, moe_expert_data
 
