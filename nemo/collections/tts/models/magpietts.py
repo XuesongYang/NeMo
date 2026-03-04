@@ -3926,7 +3926,8 @@ class MagpieTTSModel(ModelPT):
         Setup validation data with support for multiple datasets.
         Overrides parent class to handle both non-lhotse and lhotse dataloaders.
 
-        Non-lhotse config (datasets is a dict — single dataloader, multiplicity via dataset_meta):
+        Non-lhotse config (datasets is a dict -- single dataloader, multiplicity via dataset_meta)::
+
             validation_ds:
                 datasets:
                     _target_: nemo.collections.tts.data.text_to_speech_dataset.MagpieTTSDataset
@@ -3935,13 +3936,14 @@ class MagpieTTSModel(ModelPT):
                     max_duration: 20.0
                 dataloader_params: ...
 
-            Note: Non-lhotse creates a single dataloader even when dataset_meta contains
-            multiple entries (e.g., {en: ..., es: ...}). All datasets are mixed in one
-            dataloader, so validation metrics are logged jointly (e.g., prefix "en+es")
-            rather than per-dataset. For per-dataset validation metrics, use the lhotse
-            config with separate datasets list entries.
+        Note: Non-lhotse creates a single dataloader even when dataset_meta contains
+        multiple entries (e.g., ``{en: ..., es: ...}``). All datasets are mixed
+        in one dataloader, so validation metrics are logged jointly (e.g.,
+        prefix ``"en+es"``) rather than per-dataset. For per-dataset validation
+        metrics, use the lhotse config with separate datasets list entries.
 
-        Lhotse config (datasets is a list — multiple dataloaders):
+        Lhotse config (datasets is a list -- multiple dataloaders)::
+
             validation_ds:
                 use_lhotse: true
                 # ... shared settings ...
