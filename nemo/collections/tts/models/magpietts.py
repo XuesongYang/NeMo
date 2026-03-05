@@ -2794,7 +2794,7 @@ class MagpieTTSModel(ModelPT):
 
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
         batch_output = self.process_batch(batch)
         # self.process_batch returns a dict. We currently only log "logits" which come from the parallel prediction
         # head. If we use local_transformer, then the local_transformer returns "local_transformer_logits"
@@ -2956,7 +2956,7 @@ class MagpieTTSModel(ModelPT):
                 moe_expert_usage_stats['batch_expert_usage_variance'], device=loss.device
             )
 
-        self.validation_step_outputs.append(val_output)
+        self.validation_step_outputs[dataloader_idx].append(val_output)
 
         return val_output
 
@@ -3565,7 +3565,17 @@ class MagpieTTSModel(ModelPT):
                     sf.write(audio_path, predicted_audio_np, self.output_sample_rate)
 
     def on_validation_epoch_end(self):
-        collect = lambda key: torch.stack([x[key] for x in self.validation_step_outputs]).mean()
+        if len(self.validation_step_outputs) != 1:
+            raise RuntimeError(
+                "MagpieTTSModel.on_validation_epoch_end only supports a single validation dataloader. "
+                "Please override multi_validation_epoch_end for multi-dataloader validation."
+            )
+
+        outputs = self.validation_step_outputs[0]
+        if not outputs:
+            return
+
+        collect = lambda key: torch.stack([x[key] for x in outputs]).mean()
         val_loss = collect("val_loss")
         val_codebook_loss = collect("val_codebook_loss")
         val_alignment_loss = collect("val_alignment_loss")
@@ -3602,7 +3612,7 @@ class MagpieTTSModel(ModelPT):
             self.log("val/moe_router_z_loss", val_moe_router_z_loss, prog_bar=True, sync_dist=True)
 
             # Log expert usage variance (averaged across all validation batches)
-            if any('val_batch_expert_usage_variance' in x for x in self.validation_step_outputs):
+            if any('val_batch_expert_usage_variance' in x for x in outputs):
                 # This is the MEAN of batch-level variances across the epoch
                 val_epoch_mean_expert_usage_variance = collect("val_batch_expert_usage_variance")
                 self.log(
@@ -3623,7 +3633,7 @@ class MagpieTTSModel(ModelPT):
                     f"({'Balanced' if val_epoch_mean_expert_usage_variance < 0.01 else 'Imbalanced'})"
                 )
 
-        self.validation_step_outputs.clear()  # free memory
+        self.validation_step_outputs[0].clear()  # free memory
 
     def get_dataset(self, dataset_cfg, dataset_type):
         dataset = instantiate(
