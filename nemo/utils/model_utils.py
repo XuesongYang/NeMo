@@ -414,6 +414,8 @@ def resolve_test_dataloaders(model: 'ModelPT'):
         )
 
         model.setup_test_data(cfg.test_ds)
+        if model._test_dl is not None and not isinstance(model._test_dl, (list, tuple)):
+            model._test_dl = [model._test_dl]
         return
 
     ds_values = cfg.test_ds[ds_key]
@@ -451,6 +453,8 @@ def resolve_test_dataloaders(model: 'ModelPT'):
 
     else:
         model.setup_test_data(cfg.test_ds)
+        if model._test_dl is not None and not isinstance(model._test_dl, (list, tuple)):
+            model._test_dl = [model._test_dl]
         ds_names = cfg.test_ds.get('name', None)
         if ds_names is not None:
             if not isinstance(ds_names, str):
