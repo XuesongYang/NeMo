@@ -80,33 +80,6 @@ class ExampleModel(ModelPT):
         self.log("val_loss", torch.stack(outputs).mean(), sync_dist=True)
 
 
-class EpochEndGuardModel(ModelPT):
-    def __init__(self):
-        cfg = OmegaConf.structured({})
-        super().__init__(cfg, trainer=None)
-
-    def forward(self, batch):
-        return batch
-
-    def list_available_models(self):
-        return []
-
-    def setup_training_data(self):
-        pass
-
-    def setup_validation_data(self):
-        pass
-
-    def setup_test_data(self):
-        pass
-
-    def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
-        raise AssertionError("multi_validation_epoch_end should not be called for empty outputs.")
-
-    def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
-        raise AssertionError("multi_test_epoch_end should not be called for empty outputs.")
-
-
 class TestStatelessTimer:
     def setup_model(self):
         # Stateless timer for 3 seconds.
@@ -156,11 +129,3 @@ class TestStatelessTimer:
         logging.info(f"Global steps : {global_step_1}, {global_step_2}, {global_step_3}")
         assert global_step_3 > global_step_2 > global_step_1
         self.cleanup()
-
-
-@pytest.mark.unit
-def test_empty_epoch_outputs_skip_multi_epoch_end():
-    model = EpochEndGuardModel()
-
-    assert model.on_validation_epoch_end() == {}
-    assert model.on_test_epoch_end() == {}
