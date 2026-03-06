@@ -1707,7 +1707,10 @@ class ModelPT(LightningModule, Model):
         if self._validation_step_outputs is not None:
             return self._validation_step_outputs
 
-        num_dl = len(self._validation_dl) if self._validation_dl else 1
+        if isinstance(self._validation_dl, (list, tuple)) and len(self._validation_dl) > 0:
+            num_dl = len(self._validation_dl)
+        else:
+            num_dl = 1
         self._validation_step_outputs = [[] for _ in range(num_dl)]
 
         return self._validation_step_outputs
@@ -1728,7 +1731,10 @@ class ModelPT(LightningModule, Model):
         if self._test_step_outputs is not None:
             return self._test_step_outputs
 
-        num_dl = len(self._test_dl) if self._test_dl else 1
+        if isinstance(self._test_dl, (list, tuple)) and len(self._test_dl) > 0:
+            num_dl = len(self._test_dl)
+        else:
+            num_dl = 1
         self._test_step_outputs = [[] for _ in range(num_dl)]
 
         return self._test_step_outputs
