@@ -1728,7 +1728,7 @@ class ModelPT(LightningModule, Model):
         if self._test_step_outputs is not None:
             return self._test_step_outputs
 
-        num_dl = len(self._test_dl) if isinstance(self._test_dl, (list, tuple)) else 1
+        num_dl = len(self._test_dl) if self._test_dl else 1
         self._test_step_outputs = [[] for _ in range(num_dl)]
 
         return self._test_step_outputs

@@ -64,7 +64,7 @@ class AudioToAudioModel(ModelPT, ABC):
         if tag == 'val':
             num_dataloaders = len(self._validation_dl) if self._validation_dl else 1
         elif tag == 'test':
-            num_dataloaders = len(self._test_dl) if isinstance(self._test_dl, List) else 1
+            num_dataloaders = len(self._test_dl) if self._test_dl else 1
         else:
             raise ValueError(f'Unexpected tag {tag}.')
 
