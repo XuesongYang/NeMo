@@ -253,12 +253,12 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
         "reweight_temperature": config.get("reweight_temperature", None),
     }
 
-    # Standardize reweight_temperature to match the nesting depth
+    # Validate and standardize reweight_temperature to a list matching the nesting depth.
+    # Accepted formats: scalar (broadcast to all levels) or list with exact length match.
     if propagate_attrs["reweight_temperature"] is not None:
         expected_length = count_input_cfg_levels(config)
         reweight_temp = propagate_attrs["reweight_temperature"]
 
-        # Case 1: Scalar value - broadcast to all levels
         if isinstance(reweight_temp, (int, float)):
             propagate_attrs["reweight_temperature"] = [float(reweight_temp)] * expected_length
             logging.warning(
@@ -266,33 +266,15 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
                 f"Expanded to: {propagate_attrs['reweight_temperature']}"
             )
         else:
-            # Case 2: Convert to list if needed (e.g., from ListConfig)
             reweight_temp = list(reweight_temp)
-            actual_length = len(reweight_temp)
-
-            if actual_length == expected_length:
-                # Case 2.1: Exact match - no modification needed
-                propagate_attrs["reweight_temperature"] = reweight_temp
-            elif actual_length < expected_length:
-                # Case 2.2: Too short - extend by repeating last value
-                last_value = reweight_temp[-1] if reweight_temp else 1.0
-                extended = reweight_temp + [last_value] * (expected_length - actual_length)
-                propagate_attrs["reweight_temperature"] = extended
-                logging.warning(
-                    f"reweight_temperature list is shorter than nesting depth: "
-                    f"got {actual_length} values for {expected_length} levels. "
-                    f"Extending by repeating last value ({last_value}). "
-                    f"Expanded to: {extended}"
+            if len(reweight_temp) != expected_length:
+                raise ValueError(
+                    f"reweight_temperature list length ({len(reweight_temp)}) does not match "
+                    f"the input_cfg nesting depth ({expected_length}). "
+                    f"Provide exactly {expected_length} values (one per nesting level), "
+                    f"or use a scalar to apply the same temperature to all levels."
                 )
-            else:
-                # Case 2.3: Too long - trim to max depth
-                trimmed = reweight_temp[:expected_length]
-                propagate_attrs["reweight_temperature"] = trimmed
-                logging.warning(
-                    f"reweight_temperature list is longer than nesting depth: "
-                    f"got {actual_length} values for {expected_length} levels. "
-                    f"Trimming extra values. Using: {trimmed}"
-                )
+            propagate_attrs["reweight_temperature"] = reweight_temp
 
     cuts, is_tarred = parse_and_combine_datasets(config.input_cfg, propagate_attrs=propagate_attrs)
     return cuts, is_tarred

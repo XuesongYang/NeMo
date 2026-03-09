@@ -12,8 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Unit and integration tests for temperature-based data reweighting in Lhotse dataloader.
-Integration tests mock data loading and verify that weights passed to mux() are correct.
+Unit tests for temperature-based data reweighting in Lhotse dataloader.
+
+Covers:
+  - temperature_reweighting() function (pure math)
+  - Weights passed to mux() via mock-based integration (deterministic, exact)
+  - count_input_cfg_levels() nesting depth calculation
+  - reweight_temperature validation (scalar broadcast, list length mismatch errors)
+
+End-to-end integration tests that exercise the full dataloader pipeline with
+real data live in test_lhotse_dataloading.py.
 """
 from unittest.mock import MagicMock, patch
 
@@ -24,15 +32,8 @@ from omegaconf import OmegaConf
 
 from nemo.collections.common.data.lhotse.cutset import read_cutset_from_config, temperature_reweighting
 
-# =============================================================================
-# Tests for temperature_reweighting function
-# =============================================================================
-
 
 class TestTemperatureReweighting:
-    """Tests for the temperature_reweighting function with various input types."""
-
-    # --- Tests with list of 3 items (floats) ---
     def test_three_floats_temperature_1(self):
         """Three float weights with temperature=1.0 preserves ratios."""
         weights = [0.5, 0.3, 0.2]
@@ -54,7 +55,6 @@ class TestTemperatureReweighting:
         assert result[0] < 0.9  # Less dominant than original
         np.testing.assert_allclose(sum(result), 1.0, rtol=1e-7)
 
-    # --- Tests with list of 3 items (integers) ---
     def test_three_integers_temperature_1(self):
         """Three integer weights with temperature=1.0 preserves ratios."""
         weights = [197, 544, 1615]
@@ -78,21 +78,18 @@ class TestTemperatureReweighting:
         assert result[2] < 1600 / sum(weights)
         np.testing.assert_allclose(sum(result), 1.0, rtol=1e-7)
 
-    # --- Tests with list of 1 item (float) ---
     def test_single_float_any_temperature(self):
         """Single float weight returns [1.0] regardless of temperature."""
         for temp in [0.0, 0.5, 1.0, 2.0]:
             result = temperature_reweighting([0.7], temperature=temp)
             np.testing.assert_allclose(result, [1.0], rtol=1e-7)
 
-    # --- Tests with list of 1 item (integer) ---
     def test_single_integer_any_temperature(self):
         """Single integer weight returns [1.0] regardless of temperature."""
         for temp in [0.0, 0.5, 1.0, 2.0]:
             result = temperature_reweighting([1000], temperature=temp)
             np.testing.assert_allclose(result, [1.0], rtol=1e-7)
 
-    # --- Edge cases ---
     def test_empty_list(self):
         """Empty list returns empty list."""
         result = temperature_reweighting([], temperature=1.0)
@@ -114,11 +111,6 @@ class TestTemperatureReweighting:
             temperature_reweighting([100, 0, 200], temperature=1.0)
 
 
-# =============================================================================
-# Tests for weights passed to mux() are correct
-# =============================================================================
-
-
 def make_mock_parser_fn(return_tarred=True):
     """Create a mock parser function that returns a mock CutSet."""
 
@@ -131,8 +123,6 @@ def make_mock_parser_fn(return_tarred=True):
 
 
 class TestMuxWeights:
-    """Tests that verify the weights passed to mux() are correctly temperature-reweighted."""
-
     def test_flat_structure_temperature_0_equalizes_weights(self):
         """Flat structure with temperature=0.0 should equalize weights."""
         config = OmegaConf.create(
@@ -283,16 +273,10 @@ class TestMuxWeights:
         np.testing.assert_allclose(captured_mux_calls[1]["weights"], expected_level1, rtol=1e-7)
 
 
-# =============================================================================
-# Tests for count_input_cfg_levels function
-# =============================================================================
-
 from nemo.collections.common.data.lhotse.cutset import count_input_cfg_levels
 
 
 class TestCountInputCfgLevels:
-    """Tests for the count_input_cfg_levels function that computes max nesting depth."""
-
     def test_single_level_flat_structure(self):
         """Single level with no nested groups returns 1."""
         config = {
@@ -418,8 +402,6 @@ class TestCountInputCfgLevels:
 
 
 class TestReweightTemperatureValidation:
-    """Tests for standardization of reweight_temperature to match nesting depth."""
-
     def test_scalar_temperature_broadcasts_to_all_levels(self):
         """Scalar temperature is broadcast to all levels with warning."""
         config = OmegaConf.create(
@@ -454,8 +436,8 @@ class TestReweightTemperatureValidation:
                     assert "scalar" in warning_msg.lower()
                     assert "broadcasting" in warning_msg.lower()
 
-    def test_temperature_list_too_long_trims_with_warning(self):
-        """Too many temperatures are trimmed with warning."""
+    def test_temperature_list_too_long_raises_error(self):
+        """Too many temperatures raise ValueError."""
         config = OmegaConf.create(
             {
                 "input_cfg": [
@@ -467,22 +449,11 @@ class TestReweightTemperatureValidation:
             }
         )
 
-        def mock_mux(*cuts, weights=None, **kwargs):
-            return MagicMock(spec=CutSet)
+        with pytest.raises(ValueError, match="does not match"):
+            read_cutset_from_config(config)
 
-        with patch("nemo.collections.common.data.lhotse.cutset.mux", side_effect=mock_mux):
-            with patch("nemo.collections.common.data.lhotse.cutset.get_parser_fn", return_value=make_mock_parser_fn()):
-                with patch("nemo.collections.common.data.lhotse.cutset.logging") as mock_logging:
-                    cuts, is_tarred = read_cutset_from_config(config)
-                    assert cuts is not None
-                    # Verify warning was logged
-                    mock_logging.warning.assert_called_once()
-                    warning_msg = mock_logging.warning.call_args[0][0]
-                    assert "longer" in warning_msg.lower()
-                    assert "trimming" in warning_msg.lower()
-
-    def test_temperature_list_too_short_extends_with_warning(self):
-        """Too few temperatures are extended by repeating last value with warning."""
+    def test_temperature_list_too_short_raises_error(self):
+        """Too few temperatures raise ValueError."""
         config = OmegaConf.create(
             {
                 "input_cfg": [
@@ -501,19 +472,8 @@ class TestReweightTemperatureValidation:
             }
         )
 
-        def mock_mux(*cuts, weights=None, **kwargs):
-            return MagicMock(spec=CutSet)
-
-        with patch("nemo.collections.common.data.lhotse.cutset.mux", side_effect=mock_mux):
-            with patch("nemo.collections.common.data.lhotse.cutset.get_parser_fn", return_value=make_mock_parser_fn()):
-                with patch("nemo.collections.common.data.lhotse.cutset.logging") as mock_logging:
-                    cuts, is_tarred = read_cutset_from_config(config)
-                    assert cuts is not None
-                    # Verify warning was logged
-                    mock_logging.warning.assert_called_once()
-                    warning_msg = mock_logging.warning.call_args[0][0]
-                    assert "shorter" in warning_msg.lower()
-                    assert "extending" in warning_msg.lower()
+        with pytest.raises(ValueError, match="does not match"):
+            read_cutset_from_config(config)
 
     def test_correct_temperature_list_length_no_warning(self):
         """Correct temperature list length works without warning."""

@@ -109,8 +109,8 @@ class LhotseDataLoadingConfig:
     max_open_streams: int | None = None
     cuda_expandable_segments: bool = True
     # Temperature for re-weighting datasets. 1 is a neutral value. Lower temperature over-samples smaller datasets, and vice versa.
-    # Can be a scalar (applied to all levels) or a list (one per nesting level).
-    # If list length doesn't match nesting depth, it will be extended or trimmed with a warning.
+    # Can be a scalar (broadcast to all levels) or a list whose length must exactly match the input_cfg nesting depth.
+    # A list length mismatch raises ValueError.
     reweight_temperature: Any = None  # float | int | list[float] | None = None
     # e. Multi-config related options.
     #    Setting multi_config=True will scan the config for keys with DictConfig values,

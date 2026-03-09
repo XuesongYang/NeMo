@@ -150,7 +150,7 @@ where :math:`w_i` is the original weight of dataset :math:`i`, :math:`\tau` is t
 
 **Configuration Options:**
 
-The ``reweight_temperature`` parameter supports flexible formats that are automatically standardized:
+The ``reweight_temperature`` parameter accepts two formats:
 
 1. **Scalar value** (applied to all nesting levels, warning logged):
 
@@ -200,30 +200,11 @@ The ``reweight_temperature`` parameter supports flexible formats that are automa
               shar_path: /path/to/dataset3
               weight: 100
 
-3. **List shorter than maximum nesting depth** (extended by repeating last value, warning logged):
+.. note::
 
-.. code-block:: yaml
-
-    train_ds:
-      use_lhotse: true
-      reweight_temperature: [1.0]  # Extended to [1.0, 1.0] for 2 levels
-      input_cfg:
-        - type: group
-          input_cfg:
-            - type: lhotse_shar
-              shar_path: /path/to/dataset1
-
-4. **List longer than maximum nesting depth** (trimmed to match, warning logged):
-
-.. code-block:: yaml
-
-    train_ds:
-      use_lhotse: true
-      reweight_temperature: [1.0, 0.5, 0.0]  # Trimmed to [1.0] for 1 level
-      input_cfg:
-        - type: lhotse_shar
-          shar_path: /path/to/dataset1
-          weight: 100
+    If ``reweight_temperature`` is provided as a list, its length **must** exactly match the maximum nesting depth of ``input_cfg``.
+    A mismatch (too few or too many values) raises a ``ValueError``.
+    Use a scalar value instead if you want the same temperature applied uniformly to all levels.
 
 **Maximum Nesting Depth Calculation:**
 
