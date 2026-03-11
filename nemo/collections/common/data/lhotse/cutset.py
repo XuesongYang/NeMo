@@ -88,6 +88,41 @@ def temperature_reweighting(weights: List[Union[float, int]], temperature: float
     return (weights / weights.sum()).tolist()
 
 
+def validate_and_standardize_reweight_temperature(config: Union[DictConfig, dict], propagate_attrs: dict) -> None:
+    """
+    Validate and standardize reweight_temperature in propagate_attrs.
+
+    Accepted formats:
+      - Scalar (int/float): broadcast to all nesting levels (warning logged).
+      - List: length must exactly match the input_cfg nesting depth.
+
+    Raises:
+        ValueError: If list length does not match the nesting depth.
+    """
+    if propagate_attrs["reweight_temperature"] is None:
+        return
+
+    expected_length = count_input_cfg_levels(config)
+    reweight_temp = propagate_attrs["reweight_temperature"]
+
+    if isinstance(reweight_temp, (int, float)):
+        propagate_attrs["reweight_temperature"] = [float(reweight_temp)] * expected_length
+        logging.warning(
+            f"reweight_temperature is a scalar ({reweight_temp}), broadcasting to all {expected_length} levels. "
+            f"Expanded to: {propagate_attrs['reweight_temperature']}"
+        )
+    else:
+        reweight_temp = list(reweight_temp)
+        if len(reweight_temp) != expected_length:
+            raise ValueError(
+                f"reweight_temperature list length ({len(reweight_temp)}) does not match "
+                f"the input_cfg nesting depth ({expected_length}). "
+                f"Provide exactly {expected_length} values (one per nesting level), "
+                f"or use a scalar to apply the same temperature to all levels."
+            )
+        propagate_attrs["reweight_temperature"] = reweight_temp
+
+
 def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bool]:
     """
     Reads NeMo configuration and creates a CutSet either from Lhotse or NeMo manifests.
@@ -253,28 +288,7 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
         "reweight_temperature": config.get("reweight_temperature", None),
     }
 
-    # Validate and standardize reweight_temperature to a list matching the nesting depth.
-    # Accepted formats: scalar (broadcast to all levels) or list with exact length match.
-    if propagate_attrs["reweight_temperature"] is not None:
-        expected_length = count_input_cfg_levels(config)
-        reweight_temp = propagate_attrs["reweight_temperature"]
-
-        if isinstance(reweight_temp, (int, float)):
-            propagate_attrs["reweight_temperature"] = [float(reweight_temp)] * expected_length
-            logging.warning(
-                f"reweight_temperature is a scalar ({reweight_temp}), broadcasting to all {expected_length} levels. "
-                f"Expanded to: {propagate_attrs['reweight_temperature']}"
-            )
-        else:
-            reweight_temp = list(reweight_temp)
-            if len(reweight_temp) != expected_length:
-                raise ValueError(
-                    f"reweight_temperature list length ({len(reweight_temp)}) does not match "
-                    f"the input_cfg nesting depth ({expected_length}). "
-                    f"Provide exactly {expected_length} values (one per nesting level), "
-                    f"or use a scalar to apply the same temperature to all levels."
-                )
-            propagate_attrs["reweight_temperature"] = reweight_temp
+    validate_and_standardize_reweight_temperature(config, propagate_attrs)
 
     cuts, is_tarred = parse_and_combine_datasets(config.input_cfg, propagate_attrs=propagate_attrs)
     return cuts, is_tarred
