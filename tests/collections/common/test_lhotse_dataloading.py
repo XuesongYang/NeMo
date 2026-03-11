@@ -2878,7 +2878,9 @@ def test_dataloader_nemo_tarred_slice_length_multi_epoch_different_sample(
     assert epoch0_ids + epoch1_ids != sorted(epoch0_ids + epoch1_ids)  # true when slice_length=None
 
 
-def test_dataloader_reweight_temperature_intermediate_value(cutset_shar_path: Path, cutset_shar_path_other: Path):
+def test_dataloader_reweight_temperature_intermediate_value(
+    deterministic_rng, cutset_shar_path: Path, cutset_shar_path_other: Path
+):
     """
     Test that reweight_temperature=0.5 gives intermediate behavior between equal and original weights.
     With temperature=0.5, datasets with weights 900 and 100:
@@ -2923,7 +2925,10 @@ def test_dataloader_reweight_temperature_intermediate_value(cutset_shar_path: Pa
 
 
 def test_dataloader_reweight_temperature_nested_groups(
-    cutset_shar_path: Path, cutset_shar_path_other: Path, nemo_tarred_manifest_path_multi: tuple[str, str]
+    deterministic_rng,
+    cutset_shar_path: Path,
+    cutset_shar_path_other: Path,
+    nemo_tarred_manifest_path_multi: tuple[str, str],
 ):
     """
     Test that reweight_temperature works correctly with nested groups.
@@ -3014,7 +3019,10 @@ def test_dataloader_reweight_temperature_nested_groups(
 
 
 def test_dataloader_reweight_temperature_three_datasets(
-    cutset_shar_path: Path, cutset_shar_path_other: Path, nemo_tarred_manifest_path_multi: tuple[str, str]
+    deterministic_rng,
+    cutset_shar_path: Path,
+    cutset_shar_path_other: Path,
+    nemo_tarred_manifest_path_multi: tuple[str, str],
 ):
     """
     Test reweight_temperature with three datasets of different sizes.
@@ -3067,7 +3075,10 @@ def test_dataloader_reweight_temperature_three_datasets(
 
 
 def test_dataloader_reweight_temperature_deeply_nested(
-    cutset_shar_path: Path, cutset_shar_path_other: Path, nemo_tarred_manifest_path_multi: tuple[str, str]
+    deterministic_rng,
+    cutset_shar_path: Path,
+    cutset_shar_path_other: Path,
+    nemo_tarred_manifest_path_multi: tuple[str, str],
 ):
     """
     Test reweight_temperature with three levels of nesting using [1.0, 0.5, 0.0].
@@ -3157,7 +3168,9 @@ def test_dataloader_reweight_temperature_deeply_nested(
         assert "ids" in batch
 
 
-def test_dataloader_reweight_temperature_mixed_leaf_and_group(cutset_shar_path: Path, cutset_shar_path_other: Path):
+def test_dataloader_reweight_temperature_mixed_leaf_and_group(
+    deterministic_rng, cutset_shar_path: Path, cutset_shar_path_other: Path
+):
     """
     Test config with mix of leaf items and groups at the same level.
     The leaf item doesn't have nested input_cfg, but the group does.
@@ -3223,5 +3236,3 @@ def test_dataloader_reweight_temperature_mixed_leaf_and_group(cutset_shar_path: 
     nested_total = dataset_counts["N1"] + dataset_counts["N2"]
     assert dataset_counts["N1"] / nested_total == pytest.approx(0.5, abs=0.15)
     assert dataset_counts["N2"] / nested_total == pytest.approx(0.5, abs=0.15)
-
-
