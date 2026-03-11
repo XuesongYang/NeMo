@@ -498,7 +498,7 @@ def count_input_cfg_levels(config: Union[DictConfig, dict]) -> int:
 
 @data_type_parser("group")
 def parse_and_combine_datasets(
-    config_list: Union[list[DictConfig], ListConfig], propagate_attrs: dict
+    config_list: Union[list[DictConfig], ListConfig, str, Path], propagate_attrs: dict
 ) -> tuple[CutSet, bool]:
     """Parse a list of dataset configurations, potentially combining multiple datasets."""
     cuts = []
