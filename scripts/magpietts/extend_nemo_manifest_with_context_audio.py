@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 # Set below valid cosine similarity range [-1, 1] to ensure masked items are never selected
 MASKED_SIMILARITY_VALUE = -2.0
 
+# Matches CJK Unified Ideographs, Extensions, Hiragana, Katakana, Hangul Syllables,
+# and CJK Compatibility Ideographs.  Used by _tokenize_for_overlap to split CJK
+# characters individually (each carries roughly word-level meaning).
+_CJK_RE = re.compile(r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]')
+
 """
 Usage:
 python scripts/magpietts/extend_manifest_with_context_audio.py
@@ -54,6 +59,7 @@ python scripts/magpietts/extend_manifest_with_context_audio.py
     --context-min-duration 3.0
     --context-min-ssim 0.6
     --max-speaker-items 20000  # optional, prevents OOM for large speakers
+    --context-max-text-overlap 0.5  # optional, prevents selecting context with overlapping text
 
 This script distributes speakers across DDP ranks. Each rank processes its assigned speakers
 and writes a partial manifest. Rank 0 then merges these into a final manifest.
@@ -62,6 +68,35 @@ The --max-speaker-items parameter limits the size of the context pool per speake
 when computing similarity matrices. If a speaker has more items than this limit, a random
 sample will be used as the context pool, but all items will still be processed to find
 their best context from this pool.
+
+Text overlap filtering (--context-max-text-overlap):
+    When enabled, candidates whose text overlaps too much with the target are skipped
+    in favour of the next-best speaker-similarity match.  The overlap score is the
+    maximum of three token-level metrics:
+      1. Unigram Jaccard:      |A ∩ B| / |A ∪ B|
+      2. Bigram Jaccard:       same formula on adjacent token pairs (captures word order)
+      3. Overlap coefficient:  |A ∩ B| / min(|A|, |B|)  (only when both texts have ≥ 3
+                               unique tokens, to avoid false positives on very short utterances)
+
+    Tokenization is language-agnostic: alphabetic words are split by whitespace;
+    CJK characters (Chinese / Japanese / Korean) are split individually since each
+    character carries roughly word-level meaning.  No external segmenter is needed.
+
+    Threshold selection guide:
+      0.4  — Aggressive.  Catches any meaningful overlap including partial phrase
+             sharing.  Best for audiobook / read-speech data where adjacent segments
+             often share phrasing.
+      0.5  — Balanced (recommended).  Catches overlapping segments and near-duplicates
+             while allowing incidental function-word sharing.  Good default for mixed
+             datasets spanning multiple languages and speech domains.
+      0.6  — Conservative.  Only catches clear duplicates and major substring
+             relationships.  Suitable for conversational / spontaneous speech where
+             some topical word sharing is expected.
+      0.7  — Lenient.  Only catches near-exact duplicates.  Use when you want minimal
+             filtering.
+
+    When enabled, the output manifest includes a "context_audio_text_overlap" field
+    so the score distribution can be inspected to fine-tune the threshold.
 
 Input manifest example entry:
 {
@@ -80,7 +115,7 @@ Input manifest example entry:
     "normalized_text": "the face."
 }
 
-Output manifest example entry:
+Output manifest example entry (with --context-max-text-overlap enabled):
 {
     "audio_filepath": "NVYT_40K_audios_wav/_8Kirz57BTY.wav",
     "text": "the face.",
@@ -98,9 +133,10 @@ Output manifest example entry:
     "context_audio_filepath": "NVYT_40K_audios_wav/_8Kirz57BTY.wav",
     "context_audio_offset": 5.6,
     "context_audio_duration": 6.0,
-    "context_audio_text": "would you mind..", 
+    "context_audio_text": "would you mind..",
     "context_audio_normalized_text": "would you mind..",
-    "context_audio_speaker_similarity": 0.85
+    "context_audio_speaker_similarity": 0.85,
+    "context_audio_text_overlap": 0.0
 }
 """
 
@@ -111,6 +147,118 @@ def check_speaker_format(item: str):
     if not isinstance(item, str):
         return False
     return bool(re.match(pattern, item))
+
+
+def _normalize_text_for_overlap(text: str) -> str:
+    """Casefold, remove punctuation, normalize whitespace for overlap comparison.
+
+    Uses str.casefold() instead of str.lower() for proper Unicode case-folding
+    (e.g. German ß → ss, Turkish İ → i).  Python 3's \\w is Unicode-aware, so
+    characters from all scripts (Latin, CJK, Cyrillic, Arabic, …) are preserved
+    while punctuation in any script (including CJK 。，！？) is stripped.
+    """
+    text = text.casefold()
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _tokenize_for_overlap(text: str) -> list:
+    """
+    Language-agnostic tokenization for overlap detection.
+
+    Alphabetic / numeric words (space-delimited) are kept intact.
+    CJK characters are split individually — each carries roughly word-level
+    meaning, so treating them as single tokens gives correct Jaccard / overlap
+    behaviour without requiring a language-specific segmenter.
+
+    Mixed tokens (e.g. Japanese text with embedded Latin) are handled by
+    grouping consecutive non-CJK characters and emitting each CJK character
+    as its own token.
+
+    Examples:
+        "hello world"        → ["hello", "world"]
+        "你好世界"            → ["你", "好", "世", "界"]
+        "今天weather很好"     → ["今", "天", "weather", "很", "好"]
+        "bonjour le monde"   → ["bonjour", "le", "monde"]
+        "오늘 날씨가 좋습니다" → ["오", "늘", "날", "씨", "가", "좋", "습", "니", "다"]
+    """
+    tokens = []
+    for word in text.split():
+        if _CJK_RE.search(word):
+            buf = []
+            for ch in word:
+                if _CJK_RE.match(ch):
+                    if buf:
+                        tokens.append(''.join(buf))
+                        buf = []
+                    tokens.append(ch)
+                else:
+                    buf.append(ch)
+            if buf:
+                tokens.append(''.join(buf))
+        else:
+            tokens.append(word)
+    return tokens
+
+
+def _get_word_ngrams(words: list, n: int) -> set:
+    """Generate word-level n-grams as a set of tuples."""
+    if len(words) < n:
+        return set()
+    return {tuple(words[i : i + n]) for i in range(len(words) - n + 1)}
+
+
+def _compute_text_overlap(text_a: str, text_b: str) -> float:
+    """
+    Compute text overlap between two strings using token-level metrics.
+
+    Works across languages: alphabetic languages are tokenized by whitespace,
+    CJK characters (Chinese, Japanese, Korean) are split individually since
+    each character carries roughly word-level meaning.
+
+    Returns the maximum of:
+    - Unigram Jaccard:  |A ∩ B| / |A ∪ B|
+    - Bigram Jaccard:   phrase-level overlap (captures token-order)
+    - Overlap coefficient: |A ∩ B| / min(|A|, |B|)
+      (only when both texts have >= 3 unique tokens to avoid
+       false positives on very short utterances)
+
+    Returns a value in [0.0, 1.0] where 1.0 means identical.
+    """
+    norm_a = _normalize_text_for_overlap(text_a)
+    norm_b = _normalize_text_for_overlap(text_b)
+
+    words_a = _tokenize_for_overlap(norm_a)
+    words_b = _tokenize_for_overlap(norm_b)
+
+    if not words_a and not words_b:
+        return 1.0
+    if not words_a or not words_b:
+        return 0.0
+
+    set_a = set(words_a)
+    set_b = set(words_b)
+    intersection_size = len(set_a & set_b)
+    union_size = len(set_a | set_b)
+
+    scores = []
+
+    if union_size > 0:
+        scores.append(intersection_size / union_size)
+
+    bigrams_a = _get_word_ngrams(words_a, 2)
+    bigrams_b = _get_word_ngrams(words_b, 2)
+    if bigrams_a or bigrams_b:
+        bi_union = len(bigrams_a | bigrams_b)
+        if bi_union > 0:
+            scores.append(len(bigrams_a & bigrams_b) / bi_union)
+
+    min_size = min(len(set_a), len(set_b))
+    if min_size >= 3:
+        scores.append(intersection_size / min_size)
+
+    return max(scores) if scores else 0.0
 
 
 class SpeakerShardedAudioDataset(Dataset):
@@ -195,6 +343,7 @@ class EmbeddingSimilarityExtractorSharded(pl.LightningModule):
         speaker_expected_counts_map: dict,
         initial_assigned_count: int,
         max_speaker_items: int = None,
+        context_max_text_overlap: float = None,
     ):
         super().__init__()
         self.sv_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(
@@ -210,6 +359,7 @@ class EmbeddingSimilarityExtractorSharded(pl.LightningModule):
         self.speaker_expected_counts = speaker_expected_counts_map
         self.initial_assigned_count = initial_assigned_count
         self.max_speaker_items = max_speaker_items
+        self.context_max_text_overlap = context_max_text_overlap
 
         # Per-rank attributes
         self.output_file_path = None
@@ -221,6 +371,7 @@ class EmbeddingSimilarityExtractorSharded(pl.LightningModule):
         # total num of items discarded due to no suitable context for this rank
         self.total_discarded_no_suitable_context_this_rank = 0
         self.total_items_written_this_rank = 0  # total items written to manifest by this rank
+        self.total_text_overlap_skips_this_rank = 0
 
     def setup(self, stage: str):
         if stage == "predict":
@@ -233,6 +384,10 @@ class EmbeddingSimilarityExtractorSharded(pl.LightningModule):
                 logger.info(f"Max speaker items limit set to: {self.max_speaker_items}")
             else:
                 logger.info("No max speaker items limit set (potential OOM risk for very large speakers)")
+            if self.context_max_text_overlap is not None:
+                logger.info(f"Context text overlap threshold: {self.context_max_text_overlap}")
+            else:
+                logger.info("Context text overlap check is disabled (no --context-max-text-overlap set)")
             logger.debug(f"Expected speaker counts for model: {self.speaker_expected_counts}")
 
     def forward(self, batch):
@@ -363,12 +518,19 @@ class EmbeddingSimilarityExtractorSharded(pl.LightningModule):
             sorted_similarities_tensor, sorted_indices_tensor = torch.sort(similarity_matrix, dim=1, descending=True)
 
             num_records_written_for_speaker = 0
-            # Initialize a counter for items discarded for this specific speaker
             num_discarded_for_this_speaker_no_context = 0
+            num_text_overlap_skips_for_this_speaker = 0
 
             for i, current_item_data in enumerate(all_items_to_process):
                 output_record = current_item_data['metadata'].copy()
                 write_this_record = False
+
+                target_text_for_overlap = None
+                if self.context_max_text_overlap is not None:
+                    target_text_for_overlap = (
+                        current_item_data['metadata'].get('normalized_text')
+                        or current_item_data['metadata'].get('text', '')
+                    )
 
                 # Iterate through potential candidates from context pool, sorted by similarity
                 for candidate_rank in range(sorted_indices_tensor.size(1)):
@@ -389,7 +551,16 @@ class EmbeddingSimilarityExtractorSharded(pl.LightningModule):
                     candidate_duration = best_meta_dict["duration"]
 
                     if candidate_duration >= self.context_min_duration:
-                        # Found a suitable candidate, update record and stop searching for this item
+                        # Text overlap guard: skip candidates whose text overlaps too much with the target
+                        if self.context_max_text_overlap is not None:
+                            context_text = (
+                                best_meta_dict.get('normalized_text') or best_meta_dict.get('text', '')
+                            )
+                            text_overlap = _compute_text_overlap(target_text_for_overlap, context_text)
+                            if text_overlap > self.context_max_text_overlap:
+                                num_text_overlap_skips_for_this_speaker += 1
+                                continue
+
                         record_update_dict = {
                             "context_speaker_similarity": candidate_ssim,
                             "context_audio_filepath": best_meta_dict["audio_filepath"],
@@ -397,6 +568,9 @@ class EmbeddingSimilarityExtractorSharded(pl.LightningModule):
                             "context_audio_duration": candidate_duration,
                             "context_audio_text": best_meta_dict["text"],
                         }
+                        if self.context_max_text_overlap is not None:
+                            record_update_dict["context_audio_text_overlap"] = round(text_overlap, 4)
+
                         normalized_text_candidate = best_meta_dict.get("normalized_text", None)
                         if normalized_text_candidate is not None:
                             record_update_dict["context_audio_normalized_text"] = normalized_text_candidate
@@ -409,12 +583,12 @@ class EmbeddingSimilarityExtractorSharded(pl.LightningModule):
                     self.output_manifest_file.write(json.dumps(output_record, ensure_ascii=False) + "\n")
                     num_records_written_for_speaker += 1
                 else:
-                    # This item will be discarded as no suitable context was found
                     num_discarded_for_this_speaker_no_context += 1
 
             # Accumulate to rank-level total
             self.total_discarded_no_suitable_context_this_rank += num_discarded_for_this_speaker_no_context
             self.total_items_written_this_rank += num_records_written_for_speaker
+            self.total_text_overlap_skips_this_rank += num_text_overlap_skips_for_this_speaker
 
         if len(speakers_to_process_now) > 0:
             self.output_manifest_file.flush()  # ensure all data currently held in the buffer is immediately written to disk.
@@ -454,9 +628,13 @@ class EmbeddingSimilarityExtractorSharded(pl.LightningModule):
             raise ValueError(msg)
 
         logger.info(
-            f"Total items discarded on this rank due to no suitable context found (failed SSIM or duration): {self.total_discarded_no_suitable_context_this_rank}"
+            f"Total items discarded on this rank due to no suitable context found (failed SSIM, duration, or text overlap): {self.total_discarded_no_suitable_context_this_rank}"
         )
         logger.info(f"Total items written to manifest on this rank: {self.total_items_written_this_rank}")
+        if self.context_max_text_overlap is not None:
+            logger.info(
+                f"Total text overlap skips on this rank (individual candidates skipped, not items discarded): {self.total_text_overlap_skips_this_rank}"
+            )
 
         # Verification step
         expected_total_processed = (
@@ -619,6 +797,15 @@ def main():
         type=int,
         default=None,
         help="Maximum size of context pool per speaker to prevent OOM. If a speaker has more items, a random sample will be used as context pool, but all items will still be processed. Default: None (no limit, potential OOM risk).",
+    )
+    parser.add_argument(
+        "--context-max-text-overlap",
+        type=float,
+        default=None,
+        help="Maximum allowed text overlap (0.0-1.0) between target and context audio texts. "
+        "Uses the max of word-level unigram Jaccard, bigram Jaccard, and overlap coefficient. "
+        "Candidates exceeding this threshold are skipped in favor of the next best speaker-similarity match. "
+        "Default: None (disabled). Recommended: 0.6",
     )
     parser.add_argument("--devices", type=int, default=-1)
     parser.add_argument("--num-nodes", type=int, default=1)
@@ -895,6 +1082,7 @@ def main():
         speaker_expected_counts_map=my_speaker_expected_counts,
         initial_assigned_count=len(assigned_records_for_this_rank),
         max_speaker_items=args.max_speaker_items,
+        context_max_text_overlap=args.context_max_text_overlap,
     )
     logger.info(
         f"Starting prediction with {len(assigned_records_for_this_rank)} records ({len(my_speaker_expected_counts)} unique speakers for this rank according to counts)."
