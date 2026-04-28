@@ -250,6 +250,7 @@ class PositionwiseConvFFMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.top_k_experts = top_k_experts
         self.non_linearity = non_linearity
+        self._has_bias = bias
 
         # Router for expert selection
         self.router = MoERouter(
@@ -283,6 +284,9 @@ class PositionwiseConvFFMoE(torch.nn.Module):
         Padded tokens (x_mask=0) are assigned expert_indices=-1 and are not processed through any expert,
         ensuring they remain zero in the output.
 
+        Uses batched matrix multiplication (``torch.bmm``) to process all experts in parallel
+        instead of a sequential Python loop, significantly reducing CUDA kernel launch overhead.
+
         Args:
             x (torch.Tensor): Input tensor of shape (B, T, C)
             x_mask (torch.Tensor): Mask tensor of shape (B, T) where 1=valid token, 0=padding
@@ -306,8 +310,9 @@ class PositionwiseConvFFMoE(torch.nn.Module):
         # router_logits: (B, T, num_experts)
         # router_probs: (B, T, num_experts)
 
-        # Vectorized dispatch: flatten all (token, expert-slot) assignments once,
-        # sort by expert to get contiguous slices, then process each expert on its slice.
+        # Batched dispatch: flatten all (token, expert-slot) assignments once,
+        # sort by expert to get contiguous slices, pad to equal length,
+        # then process all experts in parallel via batched matmul.
         B, T, C = x.shape
         top_k = expert_indices.shape[-1]
 
@@ -344,38 +349,69 @@ class PositionwiseConvFFMoE(torch.nn.Module):
 
             # Compute per-expert assignment counts and slice boundaries.
             counts = torch.bincount(sorted_expert, minlength=self.num_experts)
-            offsets = counts.cumsum(0)
-            starts = torch.zeros_like(offsets)
-            starts[1:] = offsets[:-1]
 
-            # Process each expert on its contiguous slice of assignments.
-            for expert_idx in range(self.num_experts):
-                count = counts[expert_idx].item()
-                if count == 0:
-                    continue
+            # Only include experts that received at least one token in the batched
+            # matmul.  This avoids allocating padded rows for idle experts and
+            # reduces both the bmm batch dimension and max-padding waste.
+            active_experts = torch.where(counts > 0)[0]  # global expert indices
+            active_counts = counts[active_experts]  # token counts for active experts only
+            num_active = active_experts.size(0)
+            max_count = active_counts.max().item()
 
-                start = starts[expert_idx].item()
-                end = start + count
+            # Build a mapping from global expert id -> dense local id (0 .. num_active-1)
+            # so we can index into the compact (num_active, max_count, C) batch.
+            expert_to_local = torch.full((self.num_experts,), -1, dtype=torch.long, device=x.device)
+            expert_to_local[active_experts] = torch.arange(num_active, device=x.device)
+            local_expert = expert_to_local[sorted_expert]
 
-                expert_token_idx = sorted_token_indices[start:end]
-                expert_token_weights = sorted_weights[start:end]  # (N_assign, 1)
+            # Compute 0-based position of each assignment within its (local) expert group.
+            local_starts = torch.zeros(num_active, dtype=torch.long, device=x.device)
+            local_starts[1:] = active_counts[:-1].cumsum(0)
+            within_idx = torch.arange(len(sorted_token_indices), device=x.device) - local_starts[local_expert]
 
-                # Gather tokens for this expert: (N_assign, C)
-                # Note: expert_token_idx values are in [0, B*T-1] (token-space indices, not assignment-space indices),
-                # we can safely index into x_flat (B*T, C) with these indices.
-                expert_tokens = x_flat[expert_token_idx]
+            # Scatter tokens into a padded (num_active, max_count, C) batch —
+            # one "row" per active expert; idle experts are excluded entirely.
+            padded_input = torch.zeros(num_active, max_count, C, device=x.device, dtype=x.dtype)
+            padded_input[local_expert, within_idx] = x_flat[sorted_token_indices]
 
-                # Add batch dimension expected by conv layers: (1, N_assign, C)
-                expert_tokens = expert_tokens.unsqueeze(0)
+            # Stack expert weights from the ModuleList for batched matmul.
+            # With kernel_size=1 the Conv1d weight is (out, in, 1); squeeze the last dim.
+            # Only active experts are included to match the padded_input batch dim.
+            active_list = active_experts.tolist()
+            w1 = torch.stack(
+                [self.experts[i]['proj'].conv.weight.squeeze(-1) for i in active_list]
+            )  # (num_active, d_ffn, d_model)
+            w2 = torch.stack(
+                [self.experts[i]['o_net'].conv.weight.squeeze(-1) for i in active_list]
+            )  # (num_active, d_model, d_ffn)
 
-                # Apply expert FFN
-                expert_out = self.non_linearity(self.experts[expert_idx]['proj'](expert_tokens.transpose(1, 2)))
-                expert_out = self.dropout(self.experts[expert_idx]['o_net'](expert_out).transpose(1, 2))
-                expert_out = expert_out.squeeze(0)  # (N_assign, C)
+            # Two batched matmuls replace 2 * num_active sequential Conv1d calls.
+            # (num_active, d_ffn, d_model) @ (num_active, d_model, max_count) -> (num_active, d_ffn, max_count)
+            hidden = torch.bmm(w1, padded_input.transpose(1, 2))
 
-                # Weight and accumulate back to the source token positions.
-                expert_out = expert_out * expert_token_weights
-                output_flat.index_add_(0, expert_token_idx, expert_out)
+            if self._has_bias:
+                b1 = torch.stack([self.experts[i]['proj'].conv.bias for i in active_list])  # (num_active, d_ffn)
+                hidden = hidden + b1.unsqueeze(-1)
+
+            hidden = self.non_linearity(hidden)
+
+            # (num_active, d_model, d_ffn) @ (num_active, d_ffn, max_count) -> (num_active, d_model, max_count)
+            output_batched = torch.bmm(w2, hidden)
+
+            if self._has_bias:
+                b2 = torch.stack([self.experts[i]['o_net'].conv.bias for i in active_list])  # (num_active, d_model)
+                output_batched = output_batched + b2.unsqueeze(-1)
+
+            output_batched = self.dropout(output_batched)
+
+            # (num_active, d_model, max_count) -> (num_active, max_count, d_model)
+            output_batched = output_batched.transpose(1, 2)
+
+            # Gather valid outputs, apply routing weights, and accumulate back
+            # to the source token positions.
+            expert_outputs = output_batched[local_expert, within_idx]  # (total_assignments, d_model)
+            weighted_outputs = expert_outputs * sorted_weights
+            output_flat.index_add_(0, sorted_token_indices, weighted_outputs)
 
         # Reshape back to (B, T, C)
         output = output_flat.view(B, T, C)
