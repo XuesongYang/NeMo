@@ -1122,7 +1122,8 @@ class TestPositionwiseConvFFMoE:
         assert moe_ffn.d_ffn == self.d_ffn
         assert moe_ffn.num_experts == self.num_experts
         assert moe_ffn.top_k_experts == self.top_k_experts
-        assert len(moe_ffn.experts) == self.num_experts
+        assert moe_ffn.w1.shape == (self.num_experts, self.d_ffn, self.d_model)
+        assert moe_ffn.w2.shape == (self.num_experts, self.d_model, self.d_ffn)
 
     def test_moe_ffn_forward_shape(self):
         """Test that MoE FFN produces correct output shape."""
@@ -1232,14 +1233,8 @@ class TestPositionwiseConvFFMoE:
         assert moe_ffn.router.router.weight.grad is not None, "Router weight grad must exist"
         assert moe_ffn.router.router.weight.grad.abs().sum() > 0, "Router weight grad must be non-zero"
 
-        has_expert_grad = False
-        for expert in moe_ffn.experts:
-            for name in ('proj', 'o_net'):
-                g = expert[name].conv.weight.grad
-                if g is not None and g.abs().sum() > 0:
-                    has_expert_grad = True
-                    break
-        assert has_expert_grad, "At least one expert weight must receive a gradient"
+        assert moe_ffn.w1.grad is not None and moe_ffn.w1.grad.abs().sum() > 0, "Expert w1 must receive gradients"
+        assert moe_ffn.w2.grad is not None and moe_ffn.w2.grad.abs().sum() > 0, "Expert w2 must receive gradients"
 
     def test_all_padding_produces_zeros(self):
         """When x_mask is all zeros, output and routing info must be all zeros."""

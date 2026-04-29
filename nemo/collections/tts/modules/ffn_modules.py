@@ -14,9 +14,9 @@
 """
 Feed-forward network modules used by the MagpieTTS transformer stack.
 
-This file exists to break a circular import between ``transformer_2501``
-(which needs ``PositionwiseConvFFMoE``) and ``moe_modules`` (which needs
-``ConvolutionLayer``).  Both can safely import from this leaf module.
+``ConvolutionLayer`` and ``PositionwiseConvFF`` live here as a leaf module
+so that both ``transformer_2501`` and ``moe_modules`` can import them
+without circular dependencies.
 """
 from typing import Callable, Optional
 
