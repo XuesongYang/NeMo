@@ -2377,26 +2377,26 @@ class MagpieTTSModel(ModelPT):
         batch_output = self.process_batch(batch)
         loss = batch_output['loss']
         codebook_loss = batch_output['codebook_loss']
-        self.log('Loss:train/codebook_loss', codebook_loss, prog_bar=True, sync_dist=True)
+        self.log('Loss:train/codebook_loss', codebook_loss, prog_bar=True)
         if self.cfg_unconditional_prob == 0.0:
             # Only log alignment loss when not using cfg to avoid sync issues when
             # alignment loss is None on some ranks
             alignment_loss = batch_output['alignment_loss']
             if alignment_loss is not None:
-                self.log('Loss:train/alignment_loss', alignment_loss, prog_bar=True, sync_dist=True)
-        self.log('Loss:train/loss', loss, prog_bar=True, sync_dist=True)
+                self.log('Loss:train/alignment_loss', alignment_loss, prog_bar=True)
+        self.log('Loss:train/loss', loss, prog_bar=True)
         local_transformer_loss = batch_output['local_transformer_loss']
         if local_transformer_loss is not None:
-            self.log('Loss:train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
+            self.log('Loss:train/local_transformer_loss', local_transformer_loss, prog_bar=True)
 
         # Log MoE losses and expert usage if MoE is enabled
         moe_load_balancing_loss = batch_output.get('moe_load_balancing_loss', None)
         moe_router_z_loss = batch_output.get('moe_router_z_loss', None)
         moe_expert_usage_stats = batch_output.get('moe_expert_usage_stats', None)
         if moe_load_balancing_loss is not None and self.moe_auxiliary_loss.load_balancing_loss.loss_scale > 0:
-            self.log('Loss:train/moe_load_balancing_loss', moe_load_balancing_loss, prog_bar=True, sync_dist=True)
+            self.log('Loss:train/moe_load_balancing_loss', moe_load_balancing_loss, prog_bar=True)
         if moe_router_z_loss is not None and self.moe_auxiliary_loss.router_z_loss.loss_scale > 0:
-            self.log('Loss:train/moe_router_z_loss', moe_router_z_loss, prog_bar=True, sync_dist=True)
+            self.log('Loss:train/moe_router_z_loss', moe_router_z_loss, prog_bar=True)
         if moe_expert_usage_stats is not None:
             expert_usage = moe_expert_usage_stats['expert_usage']
             layer_expert_usage = moe_expert_usage_stats['layer_expert_usage']
@@ -2404,12 +2404,11 @@ class MagpieTTSModel(ModelPT):
             self.log(
                 'Loss:train/moe_expert_usage_variance',
                 moe_expert_usage_stats['batch_expert_usage_variance'],
-                sync_dist=True,
             )
 
             # Per-expert usage scalars
             for eidx in range(len(expert_usage)):
-                self.log(f'MoE:train/Expert_{eidx:02d}_usage', expert_usage[eidx], sync_dist=True)
+                self.log(f'MoE:train/Expert_{eidx:02d}_usage', expert_usage[eidx])
 
             # Accumulate layer-wise usage for training heatmap
             if self._moe_train_layer_usage_accum is None:
