@@ -74,45 +74,55 @@ class MoERouter(torch.nn.Module):
                 - router_probs (torch.Tensor): Router probabilities after softmax of shape (B, T, num_experts).
                     Padded positions are masked to zero.
         """
-        # Compute router logits: (B, T, num_experts)
-        router_logits = self.router(x * x_mask.unsqueeze(-1))
+        input_dtype = x.dtype
 
-        # Add jitter noise during training for exploration
-        if self.training and self.router_jitter_noise > 0:
-            noise = torch.randn_like(router_logits) * self.router_jitter_noise
-            router_logits = router_logits + noise
+        # Run router in fp32 for numerical stability under mixed-precision training.
+        with torch.amp.autocast('cuda', enabled=False):
+            x_fp32 = x.float()
+            mask_expanded = x_mask.unsqueeze(-1)
 
-        # Mask router logits to ensure padded positions remain zero
-        router_logits = router_logits * x_mask.unsqueeze(-1)
+            # Compute router logits: (B, T, num_experts)
+            router_logits = self.router(x_fp32 * mask_expanded)
 
-        # Compute routing probabilities for each token.
-        # Padded positions with logits of [0, 0, ..., 0] will produce a uniform softmax ([1/n, ..., 1/n]);
-        # this is acceptable, since we require valid probabilities for top-k selection and normalization.
-        # Sinkhorn routing is used only during training for balancing, while at inference simple softmax is used for efficiency.
-        if self.routing_strategy == "sinkhorn" and self.training:
-            router_probs = self._sinkhorn_routing(router_logits, x_mask)
-        else:
-            router_probs = F.softmax(router_logits, dim=-1)
+            # Add jitter noise during training for exploration
+            if self.training and self.router_jitter_noise > 0:
+                noise = torch.randn_like(router_logits) * self.router_jitter_noise
+                router_logits = router_logits + noise
 
-        # Select top-k experts
-        # expert_weights: (B, T, top_k), expert_indices: (B, T, top_k)
-        expert_weights, expert_indices = torch.topk(router_probs, self.top_k, dim=-1)
+            # Mask router logits to ensure padded positions remain zero
+            router_logits = router_logits * mask_expanded
 
-        # Normalize weights to sum to 1
-        # For padded positions: uniform probs -> 1/top_k
-        # For valid positions: normal routing weights
-        # Avoid division by zero when all weights are zero.
-        weight_sums = expert_weights.sum(dim=-1, keepdim=True)
-        expert_weights = expert_weights / torch.where(weight_sums > 0, weight_sums, torch.ones_like(weight_sums))
+            # Compute routing probabilities for each token.
+            # Padded positions with logits of [0, 0, ..., 0] will produce a uniform softmax ([1/n, ..., 1/n]);
+            # this is acceptable, since we require valid probabilities for top-k selection and normalization.
+            # Sinkhorn routing is used only during training for balancing, while at inference simple softmax is used for efficiency.
+            if self.routing_strategy == "sinkhorn" and self.training:
+                router_probs = self._sinkhorn_routing(router_logits, x_mask)
+            else:
+                router_probs = F.softmax(router_logits, dim=-1)
 
-        # Mask expert_weights and expert_indices for padded positions
-        # Set expert_indices to -1 for padding so they don't match any valid expert (0 to num_experts-1)
-        # This prevents padded tokens from being processed through experts
-        expert_weights = expert_weights * x_mask.unsqueeze(-1)  # Zero out weights for padding
-        expert_indices = expert_indices.masked_fill(~x_mask.unsqueeze(-1).bool(), -1)  # Set to -1 for padding
+            # Select top-k experts
+            # expert_weights: (B, T, top_k), expert_indices: (B, T, top_k)
+            expert_weights, expert_indices = torch.topk(router_probs, self.top_k, dim=-1)
 
-        # Mask router_probs for return
-        router_probs = router_probs * x_mask.unsqueeze(-1)
+            # Normalize weights to sum to 1
+            # For padded positions: uniform probs -> 1/top_k
+            # For valid positions: normal routing weights
+            # Avoid division by zero when all weights are zero.
+            weight_sums = expert_weights.sum(dim=-1, keepdim=True)
+            expert_weights = expert_weights / torch.where(weight_sums > 0, weight_sums, torch.ones_like(weight_sums))
+
+            # Mask expert_weights and expert_indices for padded positions
+            # Set expert_indices to -1 for padding so they don't match any valid expert (0 to num_experts-1)
+            # This prevents padded tokens from being processed through experts
+            expert_weights = expert_weights * mask_expanded  # Zero out weights for padding
+            expert_indices = expert_indices.masked_fill(~mask_expanded.bool(), -1)  # Set to -1 for padding
+
+            # Mask router_probs for return
+            router_probs = router_probs * mask_expanded
+
+        # Cast weights back to input dtype for downstream expert computation
+        expert_weights = expert_weights.to(input_dtype)
 
         return expert_weights, expert_indices, router_logits, router_probs
 
