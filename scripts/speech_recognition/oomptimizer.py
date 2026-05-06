@@ -92,6 +92,12 @@ class ProfilingBatchGenerator:
 
     * ``name`` is required if objects of ``cls`` have to be constructed using keyword arguments.
 
+    * ``extra_dims`` is a tuple of ints prepended between the batch dim and seq_length dim
+      for ``LabelsType``. E.g., ``extra_dims=(8,)`` generates shape ``(B, 8, T)`` for codec codes.
+
+    * ``fixed_seq_length`` is an int that overrides the bucket-derived sequence length
+      with a constant value. Useful for fixed-duration context inputs.
+
     A simple schema example for a model using audio/lengths tensor pair (unsupervised/self-supervised)::
 
         >>> {
@@ -125,23 +131,29 @@ class ProfilingBatchGenerator:
         for item in self.schema["inputs"]:
             nt = item["type"]
             if isinstance(nt, str) and nt == "constant":
-                if isinstance(val := item["value"], str) and val == "batch":
+                val = item["value"]
+                if isinstance(val, bool):
+                    tnsr = torch.full((B,), val, dtype=torch.bool, device=self.device)
+                elif isinstance(val, str) and val == "batch":
                     tnsr = torch.tensor([B], dtype=torch.long, device=self.device)
                 else:
                     tnsr = torch.tensor([val], dtype=torch.long, device=self.device)
             elif not isinstance(nt, NeuralType):  # placeholder
                 tnsr = torch.tensor([])
             elif isinstance(nt.elements_type, AudioSignal):
-                seq_length = select_seq_length[item["seq_length"]]
+                seq_length = item.get("fixed_seq_length", select_seq_length[item["seq_length"]])
                 tnsr = torch.randn(B, seq_length, dtype=torch.float32, device=self.device)
             elif isinstance(nt.elements_type, LengthsType):
-                seq_length = select_seq_length[item["seq_length"]]
+                seq_length = item.get("fixed_seq_length", select_seq_length[item["seq_length"]])
                 tnsr = torch.ones(B, dtype=torch.long, device=self.device) * seq_length
             elif isinstance(nt.elements_type, LabelsType):
-                seq_length = select_seq_length[item["seq_length"]]
-                tnsr = torch.randint(0, item["vocab_size"], size=(B, seq_length), device=self.device)
+                seq_length = item.get("fixed_seq_length", select_seq_length[item["seq_length"]])
+                extra_dims = item.get("extra_dims", ())
+                lo = item.get("vocab_offset", 0)
+                hi = lo + item["vocab_size"]
+                tnsr = torch.randint(lo, hi, size=(B, *extra_dims, seq_length), device=self.device)
             elif isinstance(nt.elements_type, MaskType):
-                seq_length = select_seq_length[item["seq_length"]]
+                seq_length = item.get("fixed_seq_length", select_seq_length[item["seq_length"]])
                 tnsr = torch.ones(B, seq_length, device=self.device)
             else:
                 raise RuntimeError("Unexpected item in oomptimizer schema: {item}")
@@ -314,6 +326,14 @@ class FloatList(click.Option):
     default=True,
     help="Whether we should simulate DDP GPU RAM usage. Stores an extra copy of the model in GPU memory. Enabled by default.",
 )
+@click.option(
+    "--config-overrides",
+    type=str,
+    default=None,
+    multiple=True,
+    help="OmegaConf dot-list overrides applied to the loaded config, e.g. 'model.codecmodel_path=/path/to/codec.nemo'. "
+    "Can be specified multiple times.",
+)
 def oomptimizer(
     pretrained_name: str | None,
     module_name: str | None,
@@ -327,6 +347,7 @@ def oomptimizer(
     device: str,
     dtype: str,
     ddp: bool,
+    config_overrides: tuple[str, ...],
 ):
     """
     OOMptimizer finds the optimal batch sizes for training your model with bucketing dataloading.
@@ -382,11 +403,15 @@ def oomptimizer(
             assert config_path is not None, "--module-name requires --config-path to be specified as well."
             assert module_name is not None, "--config-path requires --module-name to be specified as well."
             cfg = OmegaConf.load(config_path)
+            if config_overrides:
+                overrides = OmegaConf.from_dotlist(list(config_overrides))
+                cfg = OmegaConf.merge(cfg, overrides)
             namespace, name = module_name.rsplit('.', maxsplit=1)
             model_cls = getattr(importlib.import_module(namespace), name)
             model = model_cls(cfg=cfg.model, trainer=trainer).to(device)
         model_clones.append(model)
     model = model_clones[-1]
+    model.log = lambda *args, **kwargs: None
 
     if not hasattr(model, "oomptimizer_schema"):
         click.secho(
@@ -405,23 +430,23 @@ def oomptimizer(
         isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(v, Number) for v in item)
         for item in buckets
     )
-    # Determine modality for input and output.
-    modalities = [
-        (
-            "text"
-            if any(
-                isinstance(item["type"], NeuralType)
-                and isinstance(item["type"].elements_type, LabelsType)
-                and item["seq_length"] == direction
-                for item in schema["inputs"]
-                if item["type"] != "dummy"
-            )
-            else "audio"
-        )
-        for direction in ("input", "output")
-    ]
 
-    def get_max_seq_lens(buckets):
+    def get_max_seq_lens_default(buckets):
+        # Determine modality for input and output.
+        modalities = [
+            (
+                "text"
+                if any(
+                    isinstance(item["type"], NeuralType)
+                    and isinstance(item["type"].elements_type, LabelsType)
+                    and item["seq_length"] == direction
+                    for item in schema["inputs"]
+                    if item["type"] != "dummy"
+                )
+                else "audio"
+            )
+            for direction in ("input", "output")
+        ]
 
         def _determine_lens_for_bucket(bin):
             if is_2d_bucketing:
@@ -429,9 +454,7 @@ def oomptimizer(
             else:
                 input_len = bin
                 output_len = math.ceil(ratio * input_len)
-            sampling_rate = getattr(
-                model, "sample_rate", 16000
-            )  # TODO: may need to extend schema for broader model coverage
+            sampling_rate = getattr(model, "sample_rate", 16000)
             match modalities:
                 case "audio", "audio":
                     return (
@@ -453,7 +476,11 @@ def oomptimizer(
         return [_determine_lens_for_bucket(bin) for bin in buckets]
 
     click.echo("Starting profiling.")
-    max_seq_lens = get_max_seq_lens(buckets)
+    if hasattr(model, "oomptimizer_seq_len_fn"):
+        seq_len_fn = model.oomptimizer_seq_len_fn
+        max_seq_lens = [seq_len_fn(bucket, ratio) for bucket in buckets]
+    else:
+        max_seq_lens = get_max_seq_lens_default(buckets)
     gen = ProfilingBatchGenerator(schema=schema, start_batch_size=start_batch_size, rel_gap_thresh=threshold)
     profile = {}
 

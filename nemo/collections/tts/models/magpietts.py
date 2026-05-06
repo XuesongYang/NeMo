@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import json
+import math
 import os
 import random
 import re
@@ -71,6 +72,7 @@ from nemo.collections.tts.parts.utils.tts_dataset_utils import (
 )
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
+from nemo.core.neural_types import LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 
 
@@ -863,6 +865,108 @@ class MagpieTTSModel(ModelPT):
                         f"context_duration_max must be >= {min_required_context_sec} seconds "
                         f"(5 seconds x frame_stacking_factor); got context_duration_max={actual_context_length_sec}"
                     )
+
+    @property
+    def oomptimizer_schema(self) -> dict:
+        """Return a typing schema for OOMptimizer batch size calibration.
+
+        Profiles the cached-codes training path with triplet input
+        (text_tokens, context_codes, target_codes) — the dominant regime when
+        ``load_cached_codes_if_available=True``.  On-the-fly audio encoding is
+        also supported by the model but is not profiled here because the codec
+        encoder's transient memory would inflate the estimate for the typical
+        pre-encoded training run.
+
+        Buckets represent target audio duration; context is fixed-length.
+        """
+        codec_frame_rate = self.sample_rate / self.codec_model_samples_per_frame
+        context_duration = self.cfg.get('context_duration_max', 5.0)
+        ctx_frames = math.ceil(context_duration * codec_frame_rate)
+
+        inputs = [
+            {
+                "name": "text",
+                "type": NeuralType(("B", "T"), LabelsType()),
+                "seq_length": "input",
+                "vocab_size": len(self.tokenizer.tokens) + 2,
+            },
+            {"name": "text_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+            {
+                "name": "audio_codes",
+                "type": NeuralType(("B", "C", "T"), LabelsType()),
+                "seq_length": "output",
+                "vocab_size": self.num_all_tokens_per_codebook,
+                "extra_dims": (self.num_audio_codebooks,),
+            },
+            {"name": "audio_codes_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "output"},
+            {
+                "name": "context_audio_codes",
+                "type": NeuralType(("B", "C", "T"), LabelsType()),
+                "seq_length": "output",
+                "fixed_seq_length": ctx_frames,
+                "vocab_size": self.num_all_tokens_per_codebook,
+                "extra_dims": (self.num_audio_codebooks,),
+            },
+            {
+                "name": "context_audio_codes_lens",
+                "type": NeuralType(("B",), LengthsType()),
+                "seq_length": "output",
+                "fixed_seq_length": ctx_frames,
+            },
+        ]
+
+        if self.use_text_conditioning_encoder:
+            tc_name = self.text_conditioning_tokenizer_name
+            tc_tokenizer = self.tokenizer.tokenizers[tc_name]
+            tc_vocab_size = tc_tokenizer.vocab_size
+            if hasattr(tc_tokenizer, '_extra_ids'):
+                tc_vocab_size -= tc_tokenizer._extra_ids
+            tc_offset = self.tokenizer.tokenizer_offsets[tc_name]
+            if self.legacy_text_conditioning:
+                ctx_text_vocab_size = tc_vocab_size
+                ctx_text_vocab_offset = tc_offset
+            else:
+                ctx_text_vocab_size = len(self.tokenizer.tokens) + 2
+                ctx_text_vocab_offset = 0
+            inputs.extend(
+                [
+                    {
+                        "name": "context_text_tokens",
+                        "type": NeuralType(("B", "T"), LabelsType()),
+                        "seq_length": "output",
+                        "fixed_seq_length": ctx_frames,
+                        "vocab_size": ctx_text_vocab_size,
+                        "vocab_offset": ctx_text_vocab_offset,
+                    },
+                    {
+                        "name": "context_text_tokens_lens",
+                        "type": NeuralType(("B",), LengthsType()),
+                        "seq_length": "output",
+                        "fixed_seq_length": ctx_frames,
+                    },
+                    {"name": "has_text_context", "type": "constant", "value": False},
+                ]
+            )
+
+        return {"cls": dict, "inputs": inputs}
+
+    @property
+    def oomptimizer_seq_len_fn(self):
+        """Convert (bucket_duration_sec, ratio) to (input_text_tokens, output_target_frames).
+
+        Buckets represent target audio duration in seconds.
+        ``ratio`` is interpreted as text tokens per second of audio.
+        The returned frame count is raw codec frames; ``process_batch``
+        adds special tokens and applies frame stacking internally.
+        """
+        codec_frame_rate = self.sample_rate / self.codec_model_samples_per_frame
+
+        def fn(bucket_value, ratio):
+            output_frames = math.ceil(bucket_value * codec_frame_rate)
+            input_tokens = math.ceil(ratio * bucket_value)
+            return input_tokens, output_frames
+
+        return fn
 
     @property
     def has_baked_context_embedding(self) -> bool:
