@@ -2556,7 +2556,7 @@ class MagpieTTSModel(ModelPT):
 
         self.log_dict(batch_info_dict, on_step=True)
 
-        return loss
+        return {'loss': loss}
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """
