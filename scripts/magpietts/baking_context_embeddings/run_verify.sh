@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Ear-check a baked Magpie-TTS checkpoint: synthesize per-speaker, per-language samples.
-# Runs scripts/magpietts/verify_baked_embeddings.py against the ALREADY-baked checkpoint
+# Runs scripts/magpietts/baking_context_embeddings/verify_baked_embeddings.py against the baked checkpoint
 # produced by run_baking.sh -- no re-baking. Same env setup (nemo-main + fork on PYTHONPATH).
 #
 # Usage:
@@ -40,7 +40,7 @@ cd "$REPO_ROOT"
 
 # --- sanity checks ---
 [[ -x "$PYBIN" ]] || { echo "ERROR: python not found/executable: $PYBIN" >&2; exit 1; }
-[[ -f "scripts/magpietts/verify_baked_embeddings.py" ]] || {
+[[ -f "scripts/magpietts/baking_context_embeddings/verify_baked_embeddings.py" ]] || {
   echo "ERROR: verify script not found under REPO_ROOT=$REPO_ROOT" >&2
   exit 1
 }
@@ -52,7 +52,7 @@ echo "BAKED_NEMO           = $BAKED_NEMO"
 echo "nemo resolves to     : $("$PYBIN" -c 'import nemo; print(nemo.__file__)')"
 echo
 
-exec "$PYBIN" scripts/magpietts/verify_baked_embeddings.py \
+exec "$PYBIN" scripts/magpietts/baking_context_embeddings/verify_baked_embeddings.py \
   --baked-ckpt      "$BAKED_NEMO" \
   --codecmodel-path "$CODEC" \
   --languages "en" \

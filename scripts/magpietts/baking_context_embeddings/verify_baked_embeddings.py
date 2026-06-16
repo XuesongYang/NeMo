@@ -16,7 +16,7 @@
 Verify a baked Magpie-TTS checkpoint by synthesizing per-speaker, per-language samples.
 
 This loads an already-baked ``decoder_ce`` checkpoint (produced by
-``scripts/magpietts/bake_context_embeddings.py``) and synthesizes a few utterances for every
+``scripts/magpietts/baking_context_embeddings/bake_context_embeddings.py``) and synthesizes a few utterances for every
 baked speaker, so you can ear-check that each voice's timbre matches its reference. It does NOT
 bake -- run it as many times as you like without re-baking.
 
@@ -30,11 +30,12 @@ Outputs one wav per (language, speaker, sample) under:
     <out-dir>/<language>/<speaker>/sample_<j>.wav
 
 Example usage (.nemo):
-    python scripts/magpietts/verify_baked_embeddings.py \
+    python scripts/magpietts/baking_context_embeddings/verify_baked_embeddings.py \
         --baked-ckpt      /path/magpie_tts_multilingual_357m.nemo \
         --codecmodel-path nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps
     # restrict languages and sample count:
-    python scripts/magpietts/verify_baked_embeddings.py ... --languages en,es --samples-per-language 2
+    python scripts/magpietts/baking_context_embeddings/verify_baked_embeddings.py ... \
+        --languages en,es --samples-per-language 2
 
 By default it synthesizes with the standard tuned inference parameters (temperature / top-k / CFG
 plus the attention prior) matching examples/tts/magpietts_inference.py. The attention prior is
@@ -169,6 +170,13 @@ def parse_args():
         default="4,5,8,9",
         help="Comma-separated decoder layers used to estimate alignment for the attention prior.",
     )
+    parser.add_argument(
+        "--force-inference-params",
+        action="store_true",
+        help="Override the model's embedded inference_parameters with the CLI values above. By "
+        "default a .nemo that carries an inference_parameters block is used as-is (this is what "
+        "public users get), so verification exercises the deployed, param-agnostic configuration.",
+    )
 
     parser.add_argument("--device", type=str, default="cuda", help="Device to run synthesis on (cuda or cpu).")
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level.")
@@ -275,27 +283,37 @@ def main():
             "the speaker map may be stale for this checkpoint."
         )
 
-    # Use the standard tuned inference parameters (same as examples/tts/magpietts_inference.py). The
-    # config's defaults leave the attention-prior layer lists unset, so do_tts would otherwise run
-    # with the prior off and terminate almost immediately. do_tts reads these from model.inference_parameters.
-    model.inference_parameters = ModelInferenceParameters(
-        max_decoder_steps=args.max_decoder_steps,
-        temperature=args.temperature,
-        topk=args.topk,
-        cfg_scale=args.cfg_scale,
-        apply_attention_prior=True,
-        attention_prior_epsilon=0.1,
-        attention_prior_lookahead_window=5,
-        estimate_alignment_from_layers=parse_int_list(args.estimate_alignment_from_layers),
-        apply_prior_to_layers=parse_int_list(args.apply_prior_to_layers),
-        start_prior_after_n_audio_steps=0,
-        ignore_finished_sentence_tracking=True,
-        eos_detection_method="argmax_or_multinomial_any",
-    )
+    # A deployed .nemo embeds an inference_parameters block, which __init__ already loaded into
+    # model.inference_parameters; trust it by default so verification matches what public users get
+    # (a param-agnostic load). A .ckpt carries no such block -- its config defaults leave the
+    # attention-prior layer lists unset, so do_tts would run with the prior off and terminate almost
+    # immediately -- so there (or on --force-inference-params) we apply the standard tuned values
+    # (same as examples/tts/magpietts_inference.py). do_tts reads model.inference_parameters.
+    has_embedded_params = bool(model.cfg.get("inference_parameters"))
+    if has_embedded_params and not args.force_inference_params:
+        logging.info("Using inference_parameters embedded in the model (param-agnostic load).")
+    else:
+        reason = "forced by --force-inference-params" if has_embedded_params else "no embedded params (.ckpt)"
+        model.inference_parameters = ModelInferenceParameters(
+            max_decoder_steps=args.max_decoder_steps,
+            temperature=args.temperature,
+            topk=args.topk,
+            cfg_scale=args.cfg_scale,
+            apply_attention_prior=True,
+            attention_prior_epsilon=0.1,
+            attention_prior_lookahead_window=5,
+            estimate_alignment_from_layers=parse_int_list(args.estimate_alignment_from_layers),
+            apply_prior_to_layers=parse_int_list(args.apply_prior_to_layers),
+            start_prior_after_n_audio_steps=0,
+            ignore_finished_sentence_tracking=True,
+            eos_detection_method="argmax_or_multinomial_any",
+        )
+        logging.info(f"Applied CLI inference parameters ({reason}).")
+    p = model.inference_parameters
     logging.info(
-        f"Inference params: temperature={args.temperature}, topk={args.topk}, cfg_scale={args.cfg_scale}, "
-        f"estimate_alignment_from_layers={model.inference_parameters.estimate_alignment_from_layers}, "
-        f"apply_prior_to_layers={model.inference_parameters.apply_prior_to_layers}"
+        f"Inference params: temperature={p.temperature}, topk={p.topk}, cfg_scale={p.cfg_scale}, "
+        f"estimate_alignment_from_layers={p.estimate_alignment_from_layers}, "
+        f"apply_prior_to_layers={p.apply_prior_to_layers}"
     )
 
     languages = resolve_languages(model, args.languages)

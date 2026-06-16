@@ -34,8 +34,15 @@ published 357m ``.nemo``), references the public codec by name (``--nemo-codecmo
 bundles the ``{speaker_name: index}`` map as a ``speaker_map`` artifact. The same map is also
 written as a standalone sidecar JSON (browsable, and usable as a dataset ``speaker_path``).
 
+For portability, any list-type (code-switching) ``g2p.phoneme_dict`` -- e.g. Hindi's
+``hi_prondict`` + ``ipa_cmudict`` -- is collapsed into a single concatenated file registered as a
+STRING artifact. Released / older NeMo resolves only string ``nemo:`` artifacts on restore, so a
+list would otherwise reach ``IpaG2p`` unresolved and raise ``FileNotFoundError`` (e.g. on a
+Hugging Face Space). ``IpaG2p`` merges a dict list identically to one concatenated file, so the
+result is unchanged.
+
 To ear-check the baked voices afterward (without re-baking), use the companion script
-``scripts/magpietts/verify_baked_embeddings.py``.
+``scripts/magpietts/baking_context_embeddings/verify_baked_embeddings.py``.
 
 The baked contract (consumed by ``MagpieTTSModel.load_state_dict``) requires these four tensors in
 the model weights, with all ``context_encoder.*`` keys absent:
@@ -45,7 +52,7 @@ the model weights, with all ``context_encoder.*`` keys absent:
     baked_context_embedding_len      (N,) int               true unpadded T_s per speaker
 
 Example usage (un-baked .ckpt + hparams + codec .nemo in, deployable baked .nemo out):
-    python scripts/magpietts/bake_context_embeddings.py \
+    python scripts/magpietts/baking_context_embeddings/bake_context_embeddings.py \
         --hparams-file    /path/config_2605.yaml \
         --checkpoint-file /path/Magpie-TTS--val_loss_9.9725-step_497031.ckpt \
         --codecmodel-path /path/21fps_causal_codecmodel.nemo \
@@ -114,7 +121,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
-from omegaconf import open_dict
+from omegaconf import ListConfig, open_dict
 
 from nemo.collections.tts.data.text_to_speech_dataset import DatasetSample, MagpieTTSDataset
 from nemo.collections.tts.modules.magpietts_inference.utils import ModelLoadConfig, load_magpie_model
@@ -435,6 +442,79 @@ def build_inference_parameters_cfg(args) -> dict:
     }
 
 
+def collapse_list_phoneme_dicts(model, work_dir: str) -> List[str]:
+    """Collapse any list-type ``g2p.phoneme_dict`` into one concatenated file + a single string artifact.
+
+    Multi-dictionary (code-switching) tokenizers store ``g2p.phoneme_dict`` as a LIST of files (e.g.
+    Hindi = ``hi_prondict`` + ``ipa_cmudict``). Saving that to ``.nemo`` writes a list of ``nemo:``
+    paths, which only resolves on restore if the loading NeMo handles list-type artifacts. Older /
+    released NeMo (such as a Hugging Face Space) resolves only STRING ``nemo:`` artifacts, so a list
+    reaches ``IpaG2p`` unresolved and trips ``FileNotFoundError`` on ``g2p`` instantiation.
+
+    ``IpaG2p`` merges a list of dicts identically to parsing one concatenated file (each source's
+    pronunciations are appended per word, in source order -- see ``IpaG2p._parse_phoneme_dict``), so
+    we concatenate the sources (in order) into one file and register it as a single STRING artifact.
+    The resulting ``.nemo`` is then loadable by any NeMo that resolves string artifacts -- i.e.
+    portable to stock / older deployments -- with byte-for-byte the same merged phoneme dictionary.
+
+    Must run before ``save_to``; the merged file is written under ``work_dir``, which must outlive the
+    ``save_to`` call (the connector copies the file into the archive during packaging).
+
+    Returns the names of the tokenizers whose phoneme_dict was collapsed.
+    """
+    tokenizers_cfg = model.cfg.get("text_tokenizers")
+    if not tokenizers_cfg:
+        return []
+
+    collapsed = []
+    for tok_name in list(tokenizers_cfg.keys()):
+        tok_cfg = tokenizers_cfg[tok_name]
+        g2p_cfg = tok_cfg.get("g2p") if hasattr(tok_cfg, "get") else None
+        if not g2p_cfg:
+            continue
+        phoneme_dict = g2p_cfg.get("phoneme_dict")
+        if not isinstance(phoneme_dict, (list, ListConfig)):
+            continue
+
+        # After loading, each list entry is an absolute path registered by the model's
+        # _register_tokenizer_artifacts; resolve defensively in case one was left repo-relative.
+        source_paths = []
+        for entry in phoneme_dict:
+            entry = str(entry)
+            path = entry if os.path.isabs(entry) else os.path.abspath(entry)
+            if not os.path.isfile(path):
+                raise FileNotFoundError(
+                    f"phoneme_dict entry for tokenizer '{tok_name}' not found: {entry} (resolved to {path})."
+                )
+            source_paths.append(path)
+
+        # Concatenate the sources, in order, into one dict file (a newline between files is safe --
+        # IpaG2p skips lines that don't begin with a word character).
+        merged_path = os.path.join(work_dir, f"{tok_name}_merged_phoneme_dict.dict")
+        with open(merged_path, "w", encoding="utf-8") as out:
+            for i, path in enumerate(source_paths):
+                if i > 0:
+                    out.write("\n")
+                with open(path, "r", encoding="utf-8") as src:
+                    out.write(src.read())
+
+        # Drop the per-element list artifacts so save_to neither repackages them nor tries to update
+        # the now-string config key by list index, then register the merged file as one artifact.
+        # register_artifact rewrites model.cfg...phoneme_dict (list -> the merged absolute path).
+        if getattr(model, "artifacts", None):
+            for i in range(len(phoneme_dict)):
+                model.artifacts.pop(f"text_tokenizers.{tok_name}.g2p.phoneme_dict.{i}", None)
+        registered = model.register_artifact(
+            f"text_tokenizers.{tok_name}.g2p.phoneme_dict", merged_path, verify_src_exists=True
+        )
+        logging.info(
+            f"Collapsed {len(source_paths)} phoneme_dict files for tokenizer '{tok_name}' into one "
+            f"portable artifact ({os.path.basename(registered)}) for stock-NeMo .nemo portability."
+        )
+        collapsed.append(tok_name)
+    return collapsed
+
+
 def main():
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
@@ -545,17 +625,25 @@ def main():
     with open_dict(model.cfg):
         model.cfg.speaker_map = spk_artifact
 
-    os.makedirs(os.path.dirname(os.path.abspath(output_nemo)), exist_ok=True)
-    model.save_to(output_nemo)
+    # Collapse any list-type (code-switching) phoneme_dict into a single string artifact so the
+    # exported .nemo is portable to stock / older NeMo that resolves only string `nemo:` artifacts
+    # (a list otherwise reaches IpaG2p unresolved -> FileNotFoundError, e.g. on a HF Space). The
+    # merged file must outlive save_to, so the collapse + save happen inside this tempdir.
+    with tempfile.TemporaryDirectory() as portable_dir:
+        collapsed = collapse_list_phoneme_dicts(model, portable_dir)
+        os.makedirs(os.path.dirname(os.path.abspath(output_nemo)), exist_ok=True)
+        model.save_to(output_nemo)
     logging.info(
         f"Saved baked model -> {output_nemo}  (codecmodel_path={args.nemo_codecmodel_path}, "
-        f"speaker_map embedded, inference_parameters embedded)"
+        f"speaker_map embedded, inference_parameters embedded"
+        + (f", portable phoneme_dict for {collapsed}" if collapsed else "")
+        + ")"
     )
 
     logging.info(
         "Done baking. Ear-check the voices with:\n"
-        f'  python scripts/magpietts/verify_baked_embeddings.py --baked-ckpt "{output_nemo}" '
-        f'--codecmodel-path "{args.nemo_codecmodel_path}"'
+        f'  python scripts/magpietts/baking_context_embeddings/verify_baked_embeddings.py '
+        f'--baked-ckpt "{output_nemo}" --codecmodel-path "{args.nemo_codecmodel_path}"'
     )
 
 

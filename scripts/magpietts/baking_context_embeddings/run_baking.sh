@@ -44,7 +44,7 @@ cd "$REPO_ROOT"
 
 # --- sanity checks ---
 [[ -x "$PYBIN" ]] || { echo "ERROR: python not found/executable: $PYBIN" >&2; exit 1; }
-[[ -f "scripts/magpietts/bake_context_embeddings.py" ]] || {
+[[ -f "scripts/magpietts/baking_context_embeddings/bake_context_embeddings.py" ]] || {
   echo "ERROR: bake script not found under REPO_ROOT=$REPO_ROOT" >&2
   exit 1
 }
@@ -55,7 +55,7 @@ echo "CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES"
 echo "nemo resolves to     : $("$PYBIN" -c 'import nemo; print(nemo.__file__)')"
 echo
 
-exec "$PYBIN" scripts/magpietts/bake_context_embeddings.py \
+exec "$PYBIN" scripts/magpietts/baking_context_embeddings/bake_context_embeddings.py \
   --hparams-file    "$HPARAMS" \
   --checkpoint-file "$CHECKPOINT" \
   --codecmodel-path "$CODEC" \
