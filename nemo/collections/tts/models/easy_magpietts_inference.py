@@ -2137,7 +2137,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         context_audio_duration: float = 5.0,
         use_cfg: bool = True,
         cfg_scale: float = 2.5,
-        use_local_transformer: Optional[bool] = None,
+        use_local_transformer: Optional[bool] = None,  # If unset, defaults to True if AR LT is present
         temperature: float = 0.7,
         topk: int = 80,
         max_steps: int = 330,
